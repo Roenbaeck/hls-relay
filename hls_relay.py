@@ -9,6 +9,10 @@ app = Flask(__name__)
 # Set your YouTube HLS stream key here
 STREAM_KEY = "your-stream-key-here"
 
+# Set username and password for BASIC HTTP authentication for /upload_segment
+AUTH_USERNAME = 'admin'
+AUTH_PASSWORD = 'secret'
+
 # Directory to save segments and playlist
 SEGMENTS_DIR = "segments"
 PLAYLIST_FILE = os.path.join(SEGMENTS_DIR, "playlist.m3u8")
@@ -48,7 +52,7 @@ def append_segment_to_playlist(segment_name, duration=None, is_init=False):
 
 # Basic authentication
 def check_auth(username, password):
-    return username == 'admin' and password == 'secret'
+    return username == AUTH_USERNAME and password == AUTH_PASSWORD
 
 def authenticate():
     return Response(        
