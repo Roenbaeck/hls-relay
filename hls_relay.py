@@ -13,6 +13,9 @@ STREAM_KEY = "your-stream-key-here"
 AUTH_USERNAME = 'admin'
 AUTH_PASSWORD = 'secret'
 
+# Segment "buffer" size, before ffmpeg starts
+SEGMENT_BUFFER = 5
+
 # Directory to save segments and playlist
 SEGMENTS_DIR = "segments"
 PLAYLIST_FILE = os.path.join(SEGMENTS_DIR, "playlist.m3u8")
@@ -97,7 +100,7 @@ def upload_segment():
         
         # Increment segment counter and start ffmpeg if 30 segments have been uploaded
         segment_count += 1
-        if segment_count == 30:
+        if segment_count == SEGMENT_BUFFER:
             start_ffmpeg_relay()
 
     return "Segment uploaded", 200
