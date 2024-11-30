@@ -29,9 +29,17 @@ segment_buffer = {}
 last_sequence = -1  # Last sequence added to the playlist
 map_written = False  # Flag to track if #EXT-X-MAP has been written
 segment_count = 0  # Counter for uploaded segments
+ffmpeg_process = None # Variable to hold the ffmpeg process
 
 # Initialize the playlist
 def initialize_playlist():
+    global map_written, last_sequence, segment_count, segment_buffer
+    
+    map_written = False
+    last_sequence = -1
+    segment_count = 0
+    segment_buffer = {}
+    
     with open(PLAYLIST_FILE, "w") as f:
         f.write("#EXTM3U\n")
         f.write("#EXT-X-VERSION:7\n")  # Version 7 for fMP4
@@ -76,7 +84,7 @@ def requires_auth(f):
 @app.route("/upload_segment", methods=["POST"])
 @requires_auth 
 def upload_segment():
-    global last_sequence, segment_count
+    global last_sequence, segment_count, ffmpeg_process
 
     segment = request.files["segment"]  # Uploaded file
     duration = float(request.form["duration"])  # Segment duration
@@ -91,6 +99,14 @@ def upload_segment():
 
     # Buffer the segment and update the playlist
     with playlist_lock:
+        if is_init:
+            # Reset everything for new stream
+            if ffmpeg_process:
+                ffmpeg_process.terminate()
+                ffmpeg_process.wait()
+                ffmpeg_process = None 
+            initialize_playlist()
+            
         segment_buffer[sequence] = {
             "path": segment_name,
             "duration": duration,
@@ -100,7 +116,7 @@ def upload_segment():
         
         # Increment segment counter and start ffmpeg if 30 segments have been uploaded
         segment_count += 1
-        if segment_count == SEGMENT_BUFFER:
+        if segment_count == SEGMENT_BUFFER and not is_init:
             start_ffmpeg_relay()
 
     return "Segment uploaded", 200
@@ -126,6 +142,7 @@ def update_playlist():
 
 # Start the ffmpeg relay process
 def start_ffmpeg_relay():
+    global ffmpeg_process
     ffmpeg_command = [
         "ffmpeg", "-live_start_index", "0", "-fflags", "+genpts", "-i", PLAYLIST_FILE, "-flags", "+global_header",
         "-c:v", "copy", "-c:a", "copy", "-hls_init_time", "2.000", "-hls_time", "2.000",
@@ -135,7 +152,7 @@ def start_ffmpeg_relay():
     ]
     
     print(f"Starting ffmpeg relay")
-    subprocess.Popen(ffmpeg_command)
+    ffmpeg_process = subprocess.Popen(ffmpeg_command)
 
 
 # Serve the M3U8 playlist
