@@ -144,10 +144,17 @@ def update_playlist():
 def start_ffmpeg_relay():
     global ffmpeg_process
     ffmpeg_command = [
-        "ffmpeg", "-live_start_index", "0", "-fflags", "+genpts", "-i", PLAYLIST_FILE, "-flags", "+global_header",
-        "-c:v", "copy", "-c:a", "copy", "-hls_init_time", "2.000", "-hls_time", "2.000",
-        "-strftime", "1", "-master_pl_name", "master.m3u8", "-http_persistent", "1",
-        "-f", "hls", "-segment_wrap", "1", "-method", "POST",
+        "ffmpeg", 
+        "-live_start_index", "0", 
+        "-i", PLAYLIST_FILE, 
+        "-c", "copy",
+        "-hls_init_time", "4.000", 
+        "-hls_time", "4.000",
+        "-strftime", "1", 
+        "-master_pl_name", "master.m3u8", 
+        "-http_persistent", "1",
+        "-f", "hls", 
+        "-method", "POST",
         f"https://a.upload.youtube.com/http_upload_hls?cid={STREAM_KEY}&copy=0&file=master.m3u8"
     ]
     
