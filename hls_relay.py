@@ -60,6 +60,7 @@ def append_segment_to_playlist(segment_name, duration=None, is_init=False):
             # Write media segment
             f.write(f"#EXTINF:{duration:.6f},\n")
             f.write(f"{segment_name}\n")
+        f.flush()  # Ensure data is written immediately
 
 # Basic authentication
 def check_auth(username, password):
@@ -91,7 +92,7 @@ def upload_segment():
     sequence = int(request.form["sequence"])  # Sequence number
     is_init = request.form["is_init"].lower() == "true"  # Initialization flag
 
-    segment_name = f"segment_{sequence:05d}.{'mp4' if is_init else 'm4s'}"
+    segment_name = f"segment_{sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(SEGMENTS_DIR, segment_name)
 
     # Save segment to file
@@ -126,8 +127,10 @@ def upload_segment():
 def update_playlist():
     global last_sequence
 
-    while (last_sequence + 1) in segment_buffer:
-        next_sequence = last_sequence + 1
+    # Get the next sequence number to add
+    next_sequence = min(segment_buffer.keys()) if segment_buffer else None
+
+    while next_sequence is not None:
         segment = segment_buffer.pop(next_sequence)
 
         # Append to playlist
@@ -138,6 +141,8 @@ def update_playlist():
         )
 
         last_sequence = next_sequence
+        # Get the next sequence number to add from the remaining buffer
+        next_sequence = min(segment_buffer.keys()) if segment_buffer else None
 
 
 # Start the ffmpeg relay process
