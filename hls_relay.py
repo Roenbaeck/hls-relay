@@ -199,7 +199,7 @@ def start_ffmpeg_relay():
     global ffmpeg_process
     ffmpeg_command = [
         "ffmpeg", 
-	"-vsync", "0", 
+        "-vsync", "0", 
         "-copyts",
         "-i", PLAYLIST_FILE, 
         "-c", "copy",
@@ -207,6 +207,8 @@ def start_ffmpeg_relay():
         "-master_pl_name", "master.m3u8", 
         "-http_persistent", "1",
         "-f", "hls", 
+        "-hls_playlist_type", "event",
+        "-hls_allow_cache", "1",
         "-method", "POST",
         f"https://a.upload.youtube.com/http_upload_hls?cid={STREAM_KEY}&copy=0&file=master.m3u8"
     ]    
