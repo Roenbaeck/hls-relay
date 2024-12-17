@@ -116,10 +116,31 @@ def requires_auth(f):
 def upload_segment():
     global last_sequence, segment_count, ffmpeg_process, last_upload_time, check_missing_segments_started, check_missing_segments_stop_event
 
-    segment = request.files["segment"]  # Uploaded file
-    duration = float(request.form["duration"])  # Segment duration
-    sequence = int(request.form["sequence"])  # Sequence number
-    is_init = request.form["is_init"].lower() == "true"  # Initialization flag
+    # Verify required headers are present
+    required_headers = ["Initialization", "Discontinuity", "Duration", "Sequence"]
+    missing_headers = [header for header in required_headers if request.headers.get(header) is None]
+
+    if missing_headers:
+        print(f"Missing headers: {', '.join(missing_headers)}")
+        return f"Missing headers: {', '.join(missing_headers)}", 400
+    
+    # Extract data from the headers
+    try:
+        header_Initialization = request.headers.get("Initialization")
+        header_Discontinuity = request.headers.get("Discontinuity")
+        header_Duration = request.headers.get("Duration")
+        header_Sequence = request.headers.get("Sequence")
+
+        is_init = header_Initialization.lower() == "true"
+        discontinuity = header_Discontinuity.lower() == "true"
+        duration = float(header_Duration)
+        sequence = int(header_Sequence)
+    except ValueError as e:
+        print(f"Error parsing header data: {e}")
+        return "Invalid header data", 400
+    
+    # Now, request.data contains the body as bytes
+    segment_data = request.data
 
     if duration == 0 and not is_init:
         print("Warning: Received zero-duration segment. Ignoring.")
@@ -138,9 +159,10 @@ def upload_segment():
     segment_name = f"segment_{sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(SEGMENTS_DIR, segment_name)
 
-    # Save segment to file
+    # Save segment data to file
     try:
-        segment.save(segment_path)
+      with open(segment_path, "wb") as f:
+        f.write(segment_data)
     except Exception as e:
         print(f"Error saving segment: {e}")
         return "Error saving segment", 500
@@ -158,7 +180,8 @@ def upload_segment():
         segment_buffer[sequence] = {
             "path": segment_name,
             "duration": duration,
-            "is_init": is_init
+            "is_init": is_init, 
+            "discontinuity": discontinuity
         }
         update_playlist()
         
@@ -174,47 +197,58 @@ def upload_segment():
 def update_playlist():
     global last_sequence
 
-    # Continuously check for the next sequence in order
-    next_sequence = last_sequence + 1
+    # Sort segments by sequence number
+    sorted_segments = sorted(segment_buffer.items())
+    processed_sequences = []
 
-    while next_sequence in segment_buffer:
-        segment = segment_buffer.pop(next_sequence)
-
+    for sequence, segment in sorted_segments:
+        if sequence > last_sequence + 1:  # Gap Detected
+            # Check if the current segment indicates a discontinuity
+            if segment["discontinuity"]:
+               with open(PLAYLIST_FILE, "a") as f:
+                  f.write("#EXT-X-DISCONTINUITY\n")
+            else:
+                # We are waiting for segments to fill in the gap, so break out of loop
+               break
+        
         # Append to playlist
         append_segment_to_playlist(
             segment_name=segment["path"],
             duration=segment["duration"] if not segment["is_init"] else None,
             is_init=segment["is_init"]
         )
+        
+        # Update last sequence
+        last_sequence = sequence
+        processed_sequences.append(sequence)
 
-        # Update the last sequence number
-        last_sequence = next_sequence
-
-        # Check for the next in order
-        next_sequence += 1
-
+    # remove processed segments
+    for sequence in processed_sequences:
+        del segment_buffer[sequence]
 
 # Start the ffmpeg relay process
 def start_ffmpeg_relay():
     global ffmpeg_process
     ffmpeg_command = [
-        "ffmpeg", 
-        "-vsync", "0", 
-        "-copyts",
-        "-i", PLAYLIST_FILE, 
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        "-master_pl_name", "master.m3u8", 
-        "-http_persistent", "1",
-        "-f", "hls", 
-        "-hls_playlist_type", "event",
-        "-hls_allow_cache", "1",
-        "-method", "POST",
+        "ffmpeg",  
+        "-live_start_index", "0",           # Set the starting index for live streams to 0. This can resolve initial sync issues.
+        "-vsync", "0",                      # Disable video sync. This can improve performance, but may cause audio to drift out of sync with video.
+        "-copyts",                          # Copy timestamps from input to output, preserving original timing.
+        "-fflags", "+genpts",               # Generate presentation timestamps if they are missing in the input. Important for correct synchronization.
+        "-re",                              # Read input at the native frame rate, avoiding reading too fast. Helps with live input stability.
+        "-i", PLAYLIST_FILE,                # Input file is the dynamically generated HLS playlist
+        "-c", "copy",                       # Copy all input streams directly without re-encoding. This reduces CPU usage and avoids potential quality loss.
+        "-avoid_negative_ts", "make_zero",  # Adjusts negative timestamp values to start at zero. Fixes potential timestamp issues
+        "-master_pl_name", "master.m3u8",   # Sets the name for the master playlist file
+        "-http_persistent", "1",            # Enable persistent HTTP connections. This can improve performance.
+        "-f", "hls",                        # Output format is HLS (HTTP Live Streaming)
+        "-hls_playlist_type", "event",      # Sets the HLS playlist type to event, which means it's a live stream.
+        "-hls_allow_cache", "1",            # Allow caching of segments by the client. May be useful for fault tolerance.
+        "-method", "POST",                  # Specifies that the HLS segments should be sent via HTTP POST requests.
         f"https://a.upload.youtube.com/http_upload_hls?cid={STREAM_KEY}&copy=0&file=master.m3u8"
-    ]    
+    ]
     print(f"Starting ffmpeg relay")
     ffmpeg_process = subprocess.Popen(ffmpeg_command)
-
 
 # Serve the M3U8 playlist
 @app.route("/segments/playlist.m3u8")
