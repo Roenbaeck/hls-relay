@@ -29,8 +29,8 @@ streams = {}
 class StreamState:
     def __init__(self, stream_key):
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{stream_key}_{self.timestamp}")
         self.stream_id = f"{stream_key}_{self.timestamp}"  # Add this for easy access to the full identifier
+        self.stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{self.stream_id}")
         os.makedirs(self.stream_dir, exist_ok=True)
         self.playlist_file = os.path.join(self.stream_dir, "playlist.m3u8")
         self.playlist_lock = threading.Lock()
@@ -88,14 +88,20 @@ class StreamState:
     def start_ffmpeg_relay(self, stream_key):
         ffmpeg_command = [
             "ffmpeg",
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_on_network_error", "1",
+            "-reconnect_on_http_error", "4xx,5xx",
+            "-reconnect_max_retries", "60",
+            "-reconnect_delay_max", "255",
             "-live_start_index", "0",
-            "-vsync", "0",
             "-copyts",
             "-fflags", "+genpts",
             "-re",
-            "-i", self.playlist_file,
+            "-i", f"http://127.0.0.1/segments/{self.stream_id}/playlist.m3u8",
             "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
+            "-fps_mode", "passthrough",
             "-master_pl_name", "master.m3u8",
             "-http_persistent", "1",
             "-f", "hls",
@@ -225,31 +231,30 @@ def serve_playlist(stream_id):
     if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
         return "Access denied", 403
 
-    # Find the stream by its full identifier (stream_key_timestamp)
-    matching_streams = [s for s in streams.values() if s.stream_id == stream_id]
-    if not matching_streams:
+    # Construct the file path
+    playlist_file = os.path.join("segments", stream_id, "playlist.m3u8")
+    
+    if not os.path.exists(playlist_file):
         return "Stream not found", 404
 
     def generate_playlist():
-        with open(matching_streams[0].playlist_file, "r") as f:
+        with open(playlist_file, "r") as f:
             yield f.read()
-    return Response(generate_playlist(), mimetype="application/x-mpegURL")
+
+    return Response(generate_playlist(), mimetype="application/vnd.apple.mpegurl")
 
 @app.route("/segments/<stream_id>/<segment_name>")
 def serve_segment(stream_id, segment_name):
     if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
         return "Access denied", 403
 
-    # Find the stream by its full identifier (stream_key_timestamp)
-    matching_streams = [s for s in streams.values() if s.stream_id == stream_id]
-    if not matching_streams:
-        return "Stream not found", 404
-
-    segment_path = os.path.join(matching_streams[0].stream_dir, segment_name)
-    if os.path.exists(segment_path):
-        return Response(open(segment_path, "rb"), mimetype="video/mp4")
-    else:
+    # Construct the file path
+    segment_path = os.path.join("segments", stream_id, segment_name)
+    
+    if not os.path.exists(segment_path):
         return "Segment not found", 404
+
+    return Response(open(segment_path, "rb"), mimetype="video/mp4")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=80, debug=True)
