@@ -93,7 +93,6 @@ class StreamState:
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_on_http_error", "4xx,5xx",
-            "-reconnect_max_retries", "60",
             "-reconnect_delay_max", "255",
             "-live_start_index", "0",
             "-copyts",
