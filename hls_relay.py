@@ -6,19 +6,20 @@ import subprocess
 import time
 from datetime import datetime
 
-MISSING_SEGMENT_TIMEOUT = 60  # seconds
-
-app = Flask(__name__)
-
 # Set username and password for BASIC HTTP authentication for /upload_segment
-AUTH_USERNAME = 'admin'
-AUTH_PASSWORD = 'secret'
+AUTH_USERNAME = 'brute'
+AUTH_PASSWORD = 'force'
+
+# Base directory for all streams
+BASE_SEGMENTS_DIR = "segments"
 
 # Segment "buffer" size, before ffmpeg starts
 SEGMENTS_BEFORE_RELAY = 5
 
-# Base directory for all streams
-BASE_SEGMENTS_DIR = "segments"
+# 60 seconds is roughly the time is takes for YouTube to time out if no data is received
+MISSING_SEGMENT_TIMEOUT = 60  
+
+app = Flask(__name__)
 
 # Ensure the base directory exists
 os.makedirs(BASE_SEGMENTS_DIR, exist_ok=True)
@@ -67,8 +68,12 @@ class StreamState:
             f.flush()
 
     def finalize_playlist(self):
-        with open(self.playlist_file, "a") as f:
-            f.write("#EXT-X-ENDLIST\n")
+        print("Finalizing playlist")
+        try:
+            with open(self.playlist_file, "a") as f:
+                f.write("#EXT-X-ENDLIST\n")
+        except Exception as e:
+            print(f"Error in finalize_playlist: {e}")
         self.check_missing_segments_stop_event.set()
         self.check_missing_segments_started = False
 
@@ -76,13 +81,9 @@ class StreamState:
         while not self.check_missing_segments_stop_event.is_set():
             time.sleep(1)
             with self.playlist_lock:
-                if self.segment_buffer and (time.time() - self.last_upload_time > MISSING_SEGMENT_TIMEOUT):
-                    print(f"Timeout for missing segments in stream {self.stream_dir}. Finalizing playlist.")
+                if time.time() - self.last_upload_time > MISSING_SEGMENT_TIMEOUT:  
+                    print(f"Timeout for missing segments in stream {self.stream_dir}")
                     self.finalize_playlist()
-                    if self.ffmpeg_process:
-                        self.ffmpeg_process.terminate()
-                        self.ffmpeg_process.wait()
-                        self.ffmpeg_process = None
                     break
 
     def start_ffmpeg_relay(self, stream_key):
@@ -115,26 +116,37 @@ class StreamState:
     def update_playlist(self):
         sorted_segments = sorted(self.segment_buffer.items())
         processed_sequences = []
+        finalization_received = False
+        finalization_sequence = -1
 
         for sequence, segment in sorted_segments:
+            if segment["is_final"]:
+                finalization_received = True
+                finalization_sequence = sequence
+
             if sequence > self.last_sequence + 1:
                 if segment["discontinuity"]:
                     with open(self.playlist_file, "a") as f:
                         f.write("#EXT-X-DISCONTINUITY\n")
                 else:
                     break
-            
+
             self.append_segment_to_playlist(
                 segment_name=segment["path"],
                 duration=segment["duration"] if not segment["is_init"] else None,
                 is_init=segment["is_init"]
             )
-            
+
             self.last_sequence = sequence
             processed_sequences.append(sequence)
 
         for sequence in processed_sequences:
             del self.segment_buffer[sequence]
+
+        # Check for finalization after processing segments
+        if finalization_received and finalization_sequence == self.last_sequence + 1:
+            print(f"Received finalization segment at sequence {finalization_sequence}. Finalizing playlist.")
+            self.finalize_playlist()
 
 # Rest of the authentication code remains the same
 def check_auth(username, password):
@@ -159,7 +171,7 @@ def requires_auth(f):
 @requires_auth
 def upload_segment():
     # Check all required headers together
-    required_headers = ["Stream-Key", "Initialization", "Discontinuity", "Duration", "Sequence"]
+    required_headers = ["Stream-Key", "Segment-Type", "Discontinuity", "Duration", "Sequence"]
     missing_headers = [header for header in required_headers if request.headers.get(header) is None]
     if missing_headers:
         print(f"Missing headers: {', '.join(missing_headers)}")
@@ -167,20 +179,22 @@ def upload_segment():
 
     try:
         stream_key = request.headers.get("Stream-Key")
-        header_Initialization = request.headers.get("Initialization").lower() == "true"
+        header_Type = request.headers.get("Segment-Type")
         header_Discontinuity = request.headers.get("Discontinuity").lower() == "true"
         header_Duration = float(request.headers.get("Duration"))
         header_Sequence = int(request.headers.get("Sequence"))
     except ValueError as e:
         return f"Invalid header data: {e}", 400
 
+    is_init = header_Type == "Initialization"
+    is_final = header_Type == "Finalization"
     segment_data = request.data
 
-    if header_Duration == 0 and not header_Initialization:
+    if header_Duration == 0 and not is_init:
         return "Zero-duration segment ignored.", 200
 
     # Initialize new stream state if this is an init segment
-    if header_Initialization:
+    if is_init:
         streams[stream_key] = StreamState(stream_key)
 
     stream = streams[stream_key]
@@ -194,7 +208,7 @@ def upload_segment():
                 threading.Thread(target=stream.check_missing_segments, daemon=True).start()
                 stream.check_missing_segments_started = True
 
-    segment_name = f"segment_{header_Sequence:06d}.{'mp4' if header_Initialization else 'm4s'}"
+    segment_name = f"segment_{header_Sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(stream.stream_dir, segment_name)
 
     try:
@@ -204,7 +218,7 @@ def upload_segment():
         return f"Error saving segment: {e}", 500
 
     with stream.playlist_lock:
-        if header_Initialization:
+        if is_init:
             if stream.ffmpeg_process:
                 stream.ffmpeg_process.terminate()
                 stream.ffmpeg_process.wait()
@@ -214,13 +228,14 @@ def upload_segment():
         stream.segment_buffer[header_Sequence] = {
             "path": segment_name,
             "duration": header_Duration,
-            "is_init": header_Initialization,
+            "is_init": is_init,
+            "is_final": is_final,
             "discontinuity": header_Discontinuity
         }
         stream.update_playlist()
 
         stream.segment_count += 1
-        if stream.segment_count == SEGMENTS_BEFORE_RELAY and not header_Initialization:
+        if stream.segment_count == SEGMENTS_BEFORE_RELAY and not is_init:
             stream.start_ffmpeg_relay(stream_key)
 
     return "Segment uploaded", 200
