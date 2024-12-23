@@ -94,7 +94,8 @@ class StreamState:
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_on_http_error", "4xx,5xx",
-            "-reconnect_delay_max", "255",
+            "-reconnect_delay_max", "300",
+            "-reconnect_delay_total_max", "3000", # requires ffmpeg v7.x
             "-live_start_index", "0",
             "-copyts",
             "-fflags", "+genpts",
