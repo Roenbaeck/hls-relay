@@ -16,8 +16,8 @@ BASE_SEGMENTS_DIR = "segments"
 # Segment "buffer" size, before ffmpeg starts
 SEGMENTS_BEFORE_RELAY = 5
 
-# 60 seconds is roughly the time is takes for YouTube to time out if no data is received
-MISSING_SEGMENT_TIMEOUT = 60  
+# 200 seconds is roughly the time is takes for YouTube to time out if no data is received
+MISSING_SEGMENT_TIMEOUT = 200
 
 app = Flask(__name__)
 
@@ -94,8 +94,11 @@ class StreamState:
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_on_http_error", "4xx,5xx",
-            "-reconnect_delay_max", "300",
-            "-reconnect_delay_total_max", "3000", # requires ffmpeg v7.x
+            "-reconnect_delay_max", f"{MISSING_SEGMENT_TIMEOUT}",
+            "-reconnect_delay_total_max", f"{MISSING_SEGMENT_TIMEOUT}",
+            "-max_reload", f"{MISSING_SEGMENT_TIMEOUT}",
+            "-m3u8_hold_counters", f"{MISSING_SEGMENT_TIMEOUT}",
+            "-seg_max_retry", f"{MISSING_SEGMENT_TIMEOUT}",
             "-live_start_index", "0",
             "-copyts",
             "-fflags", "+genpts",
