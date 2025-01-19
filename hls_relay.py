@@ -1,3 +1,5 @@
+# Typical start command: 
+# python -u hls_relay.py &> 20250119.log
 from flask import Flask, request, Response
 from functools import wraps
 import os
@@ -9,6 +11,10 @@ from datetime import datetime
 # Set username and password for BASIC HTTP authentication for /upload_segment
 AUTH_USERNAME = 'brute'
 AUTH_PASSWORD = 'force'
+
+# Port number to listen for incoming connections on, with 80 or 8080 being common choices
+# Needs to be over 1024 if you are not a privileged user
+PORT = 8080
 
 # Base directory for all streams
 BASE_SEGMENTS_DIR = "segments"
@@ -290,4 +296,4 @@ def serve_segment(stream_id, segment_name):
     return Response(open(segment_path, "rb"), mimetype="video/mp4")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80, debug=True)
+    app.run(host="0.0.0.0", port=PORT, debug=True)
