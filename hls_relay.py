@@ -128,7 +128,7 @@ class StreamState:
                 "-i", f"http://127.0.0.1/segments/{self.stream_id}/playlist.m3u8",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
-                "-b:v", "4M",
+                "-b:v", "8M",
                 "-pix_fmt", "yuv420p",
                 "-bufsize", "16000k",
                 "-g", "60",
