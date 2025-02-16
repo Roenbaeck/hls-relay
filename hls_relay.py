@@ -36,6 +36,7 @@ streams = {}
 
 class StreamState:
     def __init__(self, stream_key):
+        self.stream_key = stream_key
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.stream_id = f"{stream_key}_{self.timestamp}"
         self.stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{self.stream_id}")
@@ -73,6 +74,13 @@ class StreamState:
         self.check_missing_segments_stop_event.set()
         self.check_missing_segments_started = False
 
+        # Remove this finished stream from the global streams dictionary
+        global streams
+        with stream_creation_lock:
+            # Only remove if this instance is still the one associated with its stream key
+            if streams.get(self.stream_key) is self:
+                del streams[self.stream_key]
+                
     def check_missing_segments(self):
         while not self.check_missing_segments_stop_event.is_set():
             time.sleep(1)
