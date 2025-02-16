@@ -80,7 +80,7 @@ class StreamState:
             # Only remove if this instance is still the one associated with its stream key
             if streams.get(self.stream_key) is self:
                 del streams[self.stream_key]
-                
+
     def check_missing_segments(self):
         while not self.check_missing_segments_stop_event.is_set():
             time.sleep(1)
@@ -106,7 +106,7 @@ class StreamState:
                 "-copyts",
                 "-fflags", "+genpts",
                 "-re",
-                "-i", f"http://127.0.0.1/segments/{self.stream_id}/playlist.m3u8",
+                "-i", f"http://127.0.0.1:{PORT}/segments/{self.stream_id}/playlist.m3u8",
                 "-c", "copy",
                 "-fps_mode", "passthrough",
                 "-master_pl_name", "master.m3u8",
@@ -133,7 +133,7 @@ class StreamState:
                 "-copyts",
                 "-fflags", "+genpts",
                 "-re",
-                "-i", f"http://127.0.0.1/segments/{self.stream_id}/playlist.m3u8",
+                "-i", f"http://127.0.0.1:{PORT}/segments/{self.stream_id}/playlist.m3u8",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-b:v", "8M",
