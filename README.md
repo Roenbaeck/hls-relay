@@ -93,6 +93,15 @@ curl -X POST http://localhost:8080/upload_segment \
 - `GET /segments/<stream_id>/playlist.m3u8`: Serve the HLS playlist (localhost only).
 - `GET /segments/<stream_id>/<segment_name>`: Serve individual segments (localhost only).
 
+## Creating a movie MP4
+
+After a completed stream, the fragmented MP4 files can be assembled into a movie MP4 as a single file. Run this command in a stream folder containing the fragmented MP4 files: 
+```bash
+ffmpeg -live_start_index 0 -i playlist.m3u8 -c copy movie.mp4
+```
+
+This creates a movie.mp4 by remuxing, so the video and audio quality is unaffected.
+
 ## Troubleshooting
 
 - **Streams not appearing on YouTube**: Check FFmpeg logs for errors. Ensure the stream key is correct and the broadcast is started in YouTube Studio.
