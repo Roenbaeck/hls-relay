@@ -14,7 +14,7 @@ A simple HTTP server that accepts HLS streams in fragmented MP4 (fMP4) format an
 ## Installation
 
 ### Prerequisites
-- Python 3.x with Flask (`pip install flask` or `apk add py3-flask` on Alpine Linux)
+- Python 3.x with Flask (`pip install flask waitress` or `apk add py3-flask py3-waitress` on Alpine Linux)
 - FFmpeg 6.x or later (for remuxing and relaying)
 
 ### Quick Start
@@ -26,7 +26,7 @@ A simple HTTP server that accepts HLS streams in fragmented MP4 (fMP4) format an
 
 2. Install dependencies:
    ```bash
-   pip install flask
+   pip install flask waitress
    ```
 
 3. Run the server:

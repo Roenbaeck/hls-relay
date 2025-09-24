@@ -338,4 +338,7 @@ def serve_segment(stream_id, segment_name):
     return Response(open(segment_path, "rb"), mimetype="video/mp4")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=True)
+    from waitress import serve
+    print(f"Starting production server with Waitress on http://0.0.0.0:{PORT}")
+    serve(app, host="0.0.0.0", port=PORT)
+    
