@@ -25,6 +25,9 @@ SEGMENTS_BEFORE_RELAY = 3
 # 60 seconds is roughly the time is takes for YouTube to time out if no data is received
 MISSING_SEGMENT_TIMEOUT = 60
 
+# Timeout for skipping missing segments when new segments are arriving
+GAP_SKIP_TIMEOUT = 10
+
 app = Flask(__name__)
 
 # Ensure the base directory exists
@@ -49,6 +52,7 @@ class StreamState:
         self.written_segment_count = 0
         self.ffmpeg_process = None
         self.last_upload_time = time.time()
+        self.last_add_time = time.time()
         self.check_missing_segments_started = False
         self.check_missing_segments_stop_event = threading.Event()
 
@@ -84,7 +88,7 @@ class StreamState:
     def check_missing_segments(self):
         while not self.check_missing_segments_stop_event.is_set():
             time.sleep(1)
-            if time.time() - self.last_upload_time > MISSING_SEGMENT_TIMEOUT:
+            if time.time() - self.last_upload_time > MISSING_SEGMENT_TIMEOUT or time.time() - self.last_add_time > MISSING_SEGMENT_TIMEOUT:
                 print(f"Timeout for missing segments in stream {self.stream_dir}")
                 self.finalize_playlist()
                 break
@@ -153,6 +157,8 @@ class StreamState:
         self.ffmpeg_process = subprocess.Popen(ffmpeg_command)
 
     def update_playlist(self):
+        added = False
+        gap_wait_start = time.time()
         while True:
             next_sequence = self.last_playlist_sequence + 1
             if next_sequence in self.arrived_segments:
@@ -171,8 +177,36 @@ class StreamState:
 
                 self.written_segment_count += 1
                 self.last_playlist_sequence = next_sequence
+                added = True
+                gap_wait_start = time.time()
             else:
-                break
+                # Check if we should skip the gap
+                if time.time() - gap_wait_start > GAP_SKIP_TIMEOUT:
+                    candidates = [seq for seq in self.arrived_segments if isinstance(seq, int) and seq > self.last_playlist_sequence]
+                    if candidates:
+                        next_seq = min(candidates)
+                        segment_info = self.arrived_segments.pop(next_seq)
+                        segment_name = segment_info['filename']
+                        duration = segment_info['duration']
+                        is_init = segment_info['is_init']
+                        discontinuity = segment_info['discontinuity']
+
+                        with open(self.playlist_file, "a") as f:
+                            f.write("#EXT-X-DISCONTINUITY\n")
+                            if not is_init:
+                                f.write(f"#EXTINF:{duration:.6f},\n")
+                                f.write(f"{segment_name}\n")
+
+                        self.written_segment_count += 1
+                        self.last_playlist_sequence = next_seq
+                        added = True
+                        gap_wait_start = time.time()
+                    else:
+                        break
+                else:
+                    break
+        if added:
+            self.last_add_time = time.time()
         # Check for finalization after processing segments
         if 'final' in self.arrived_segments:
             self.finalize_playlist()
