@@ -33,6 +33,18 @@ A simple HTTP server that accepts HLS streams in fragmented MP4 (fMP4) format an
    ```bash
    python hls_relay.py
    ```
+   or with persisted logging in Linux and macOS:
+   ```bash
+   python -u hls_relay.py &> hls_relay.log
+   ```
+   Windows command prompt:
+   ```bat
+   python -u hls_relay.py > hls_relay.log 2>&1
+   ```
+   Windows PowerShell:
+   ```bat
+   python -u hls_relay.py *> hls_relay.log
+   ```
 
 For Docker setup, see the tutorial: [YouTube Tutorial](https://www.youtube.com/watch?v=Qzq6nCsHt5c)
 
