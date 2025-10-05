@@ -55,6 +55,7 @@ class StreamState:
         self.last_add_time = time.time()
         self.check_missing_segments_started = False
         self.check_missing_segments_stop_event = threading.Event()
+        self.period_index = 0  # increments when a new init arrives after stream started
 
     def initialize_playlist(self, init_sequence, init_segment_name):
         print(f"Initializing playlist for stream {self.stream_id}")
@@ -107,7 +108,6 @@ class StreamState:
                 "-m3u8_hold_counters", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-seg_max_retry", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-live_start_index", str(live_start_index),
-                "-copyts",
                 "-fflags", "+genpts",
                 "-re",
                 "-i", f"http://127.0.0.1:{PORT}/segments/{self.stream_id}/playlist.m3u8",
@@ -134,7 +134,6 @@ class StreamState:
                 "-m3u8_hold_counters", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-seg_max_retry", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-live_start_index", str(live_start_index),
-                "-copyts",
                 "-fflags", "+genpts",
                 "-re",
                 "-i", f"http://127.0.0.1:{PORT}/segments/{self.stream_id}/playlist.m3u8",
@@ -189,7 +188,7 @@ class StreamState:
                         segment_name = segment_info['filename']
                         duration = segment_info['duration']
                         is_init = segment_info['is_init']
-                        discontinuity = segment_info['discontinuity']
+                        discontinuity = True  # force discontinuity when skipping
 
                         with open(self.playlist_file, "a") as f:
                             f.write("#EXT-X-DISCONTINUITY\n")
@@ -261,7 +260,7 @@ def upload_segment():
             streams[header_stream_key] = StreamState(header_stream_key)
         stream = streams[header_stream_key]
 
-    segment_name = f"segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
+    segment_name = f"p{stream.period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(stream.stream_dir, segment_name)
 
     try:
@@ -282,12 +281,15 @@ def upload_segment():
 
     with stream.playlist_lock:
         if is_init:
-            if stream.ffmpeg_process:
-                stream.ffmpeg_process.terminate()
-                stream.ffmpeg_process.wait()
-                stream.ffmpeg_process = None
-            stream.initialize_playlist(header_sequence, segment_name)
-
+            if not stream.map_written:
+                # First init: start playlist fresh
+                stream.initialize_playlist(header_sequence, segment_name)
+            else:
+                # Subsequent init: append new period without truncating playlist
+                with open(stream.playlist_file, "a") as f:
+                    f.write("#EXT-X-DISCONTINUITY\n")
+                    f.write(f"#EXT-X-MAP:URI=\"{segment_name}\"\n")
+                stream.period_index += 1
         stream.arrived_segments[header_sequence] = {
             "filename": segment_name,
             "duration": header_duration,
@@ -341,4 +343,3 @@ if __name__ == "__main__":
     from waitress import serve
     print(f"Starting production server with Waitress on http://0.0.0.0:{PORT}")
     serve(app, host="0.0.0.0", port=PORT)
-    
