@@ -97,7 +97,7 @@ class StreamState:
                 self.finalize_playlist()
                 break
 
-    def start_ffmpeg_relay(self, target, stream_key, live_start_index=0):
+    def start_ffmpeg_relay(self, target, stream_key, live_start_index=None):
         if target == "youtube":
             ffmpeg_command = [
                 "ffmpeg",
@@ -110,8 +110,11 @@ class StreamState:
                 "-max_reload", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-m3u8_hold_counters", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-seg_max_retry", f"{MISSING_SEGMENT_TIMEOUT}",
-                "-live_start_index", str(live_start_index),
-                "-fflags", "+genpts",
+            ] + ([] if live_start_index is None else [
+                "-live_start_index", str(live_start_index)
+            ]) + [
+                "-copyts",
+                "-fflags", "+igndts",
                 "-re",
                 "-i", f"http://127.0.0.1:{PORT}/segments/{self.stream_id}/playlist.m3u8",
                 "-c", "copy",
@@ -136,8 +139,11 @@ class StreamState:
                 "-max_reload", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-m3u8_hold_counters", f"{MISSING_SEGMENT_TIMEOUT}",
                 "-seg_max_retry", f"{MISSING_SEGMENT_TIMEOUT}",
-                "-live_start_index", str(live_start_index),
-                "-fflags", "+genpts",
+            ] + ([] if live_start_index is None else [
+                "-live_start_index", str(live_start_index)
+            ]) + [
+                "-copyts",
+                "-fflags", "+igndts",
                 "-re",
                 "-i", f"http://127.0.0.1:{PORT}/segments/{self.stream_id}/playlist.m3u8",
                 "-c:v", "libx264",
@@ -155,7 +161,8 @@ class StreamState:
         else:
             raise ValueError(f"Unsupported target: {target}")
 
-        print(f"Starting ffmpeg relay for stream {stream_key} to target {target} with live_start_index {live_start_index}")
+        start_desc = "edge" if live_start_index is None else str(live_start_index)
+        print(f"Starting ffmpeg relay for stream {stream_key} to target {target} with live_start_index {start_desc}")
         self.ffmpeg_process = subprocess.Popen(ffmpeg_command)
 
     def update_playlist(self):
@@ -329,10 +336,10 @@ def upload_segment():
         if stream.written_segment_count >= SEGMENTS_BEFORE_RELAY:
             if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
                 print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments")
-                stream.start_ffmpeg_relay(header_target, header_stream_key)
+                stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=0)
             elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
-                print(f"Restarting ffmpeg for stream {stream.stream_id} with live_start_index {stream.last_playlist_sequence + 1}")
-                stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=stream.last_playlist_sequence + 1)
+                print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge")
+                stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=None)
 
     return "Segment uploaded", 200
 
