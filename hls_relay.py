@@ -56,6 +56,9 @@ class StreamState:
         self.check_missing_segments_started = False
         self.check_missing_segments_stop_event = threading.Event()
         self.period_index = 0  # increments when a new init arrives after stream started
+        # Gap handling state
+        self._gap_wait_seq = None
+        self._gap_wait_start = None
 
     def initialize_playlist(self, init_sequence, init_segment_name):
         print(f"Initializing playlist for stream {self.stream_id}")
@@ -157,7 +160,6 @@ class StreamState:
 
     def update_playlist(self):
         added = False
-        gap_wait_start = time.time()
         while True:
             next_sequence = self.last_playlist_sequence + 1
             if next_sequence in self.arrived_segments:
@@ -174,39 +176,58 @@ class StreamState:
                         f.write(f"#EXTINF:{duration:.6f},\n")
                         f.write(f"{segment_name}\n")
 
-                self.written_segment_count += 1
+                # Only count media segments toward the buffer threshold
+                if not is_init:
+                    self.written_segment_count += 1
                 self.last_playlist_sequence = next_sequence
                 added = True
-                gap_wait_start = time.time()
-            else:
-                # Check if we should skip the gap
-                if time.time() - gap_wait_start > GAP_SKIP_TIMEOUT:
-                    candidates = [seq for seq in self.arrived_segments if isinstance(seq, int) and seq > self.last_playlist_sequence]
-                    if candidates:
-                        next_seq = min(candidates)
-                        segment_info = self.arrived_segments.pop(next_seq)
-                        segment_name = segment_info['filename']
-                        duration = segment_info['duration']
-                        is_init = segment_info['is_init']
-                        discontinuity = True  # force discontinuity when skipping
+                # Reset any gap wait state
+                self._gap_wait_seq = None
+                self._gap_wait_start = None
+                continue
 
-                        with open(self.playlist_file, "a") as f:
-                            f.write("#EXT-X-DISCONTINUITY\n")
-                            if not is_init:
-                                f.write(f"#EXTINF:{duration:.6f},\n")
-                                f.write(f"{segment_name}\n")
+            # Missing next_sequence
+            now = time.time()
+            if self._gap_wait_seq != next_sequence:
+                # Start waiting for this specific sequence
+                self._gap_wait_seq = next_sequence
+                self._gap_wait_start = now
+                break  # Exit; will be called again on next upload
 
-                        self.written_segment_count += 1
-                        self.last_playlist_sequence = next_seq
-                        added = True
-                        gap_wait_start = time.time()
-                    else:
-                        break
-                else:
+            # Already waiting for this sequence; decide to skip?
+            waited = now - (self._gap_wait_start or now)
+            if waited >= GAP_SKIP_TIMEOUT:
+                # Find the next available higher sequence
+                candidates = [seq for seq in self.arrived_segments if isinstance(seq, int) and seq > self.last_playlist_sequence]
+                if not candidates:
                     break
+                next_seq = min(candidates)
+                segment_info = self.arrived_segments.pop(next_seq)
+                segment_name = segment_info['filename']
+                duration = segment_info['duration']
+                is_init = segment_info['is_init']
+
+                with open(self.playlist_file, "a") as f:
+                    f.write("#EXT-X-DISCONTINUITY\n")
+                    if not is_init:
+                        f.write(f"#EXTINF:{duration:.6f},\n")
+                        f.write(f"{segment_name}\n")
+
+                if not is_init:
+                    self.written_segment_count += 1
+                self.last_playlist_sequence = next_seq
+                added = True
+                # Reset or continue loop to handle more available sequences
+                self._gap_wait_seq = None
+                self._gap_wait_start = None
+                continue
+
+            # Haven't waited long enough; exit quickly to avoid blocking
+            break
+
         if added:
             self.last_add_time = time.time()
-        # Check for finalization after processing segments
+        # Finalization flag
         if 'final' in self.arrived_segments:
             self.finalize_playlist()
             del self.arrived_segments['final']
@@ -290,12 +311,16 @@ def upload_segment():
                     f.write("#EXT-X-DISCONTINUITY\n")
                     f.write(f"#EXT-X-MAP:URI=\"{segment_name}\"\n")
                 stream.period_index += 1
-        stream.arrived_segments[header_sequence] = {
-            "filename": segment_name,
-            "duration": header_duration,
-            "is_init": is_init,
-            "discontinuity": header_discontinuity
-        }
+        # Drop stale media segments from queue (but keep file on disk)
+        if (not is_init) and header_sequence <= stream.last_playlist_sequence:
+            print(f"Stale segment ignored for playlist: seq={header_sequence} (last={stream.last_playlist_sequence}) stream={stream.stream_id}")
+        else:
+            stream.arrived_segments[header_sequence] = {
+                "filename": segment_name,
+                "duration": header_duration,
+                "is_init": is_init,
+                "discontinuity": header_discontinuity
+            }
         if is_final:
             stream.arrived_segments['final'] = True # Use a simple flag for finalization
 
