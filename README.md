@@ -9,6 +9,7 @@ A simple HTTP server that accepts HLS streams in fragmented MP4 (fMP4) format an
 - **Multi-Platform Support**: Supports YouTube (HLS upload) and Twitch (RTMP).
 - **Automatic Stream Management**: Handles stream initialization, buffering, and finalization.
 - **Basic Authentication**: Protects upload endpoints with HTTP Basic Auth.
+- **Remote Status Monitoring**: Inspect relay health, FFmpeg state, and utilization via a JSON status endpoint.
 - **Docker Support**: Easy deployment via Docker (see tutorial below).
 
 ## Installation
@@ -33,6 +34,10 @@ A simple HTTP server that accepts HLS streams in fragmented MP4 (fMP4) format an
    ```bash
    python hls_relay.py
    ```
+   or log to daily files with the helper script:
+   ```bash
+   ./run_hls_relay.sh
+   ```
    or with persisted logging in Linux and macOS:
    ```bash
    python -u hls_relay.py &> hls_relay.log
@@ -56,6 +61,10 @@ Edit the constants at the top of `hls_relay.py`:
 - `PORT`: Server port (default: 8080).
 - `SEGMENTS_BEFORE_RELAY`: Number of segments to buffer before starting FFmpeg (default: 3).
 - `MISSING_SEGMENT_TIMEOUT`: Timeout in seconds for missing segments (default: 60).
+- `BASE_SEGMENTS_DIR`: Root folder for persisted stream data (default: `segments`).
+- `GAP_SKIP_TIMEOUT`: Seconds to wait before skipping a missing segment if new ones keep arriving (default: 10).
+- `UPLOAD_UTIL_WINDOW`: Sliding window (in seconds) used for the utilization metric reported by the status endpoint (default: 60).
+- `MAX_EVENT_HISTORY`: Number of recent lifecycle events to retain per stream (default: 20).
 
 ## Usage
 
@@ -92,6 +101,25 @@ curl -X POST http://localhost:8080/upload_segment \
 - `POST /upload_segment`: Upload HLS segments (requires auth).
 - `GET /segments/<stream_id>/playlist.m3u8`: Serve the HLS playlist (localhost only).
 - `GET /segments/<stream_id>/<segment_name>`: Serve individual segments (localhost only).
+- `GET /status/<stream_key>`: JSON status for the active stream and recent history.
+
+### Status Endpoint
+
+The status endpoint is reachable from remote hosts and returns a JSON payload describing relay health for a given stream key. Example:
+
+```bash
+curl http://your-server:8080/status/YOUR_STREAM_KEY
+```
+
+The response includes:
+- `active`: Whether the stream session is currently running.
+- `pending_sequences`: Media segments queued but not yet flushed to the playlist.
+- `last_upload_age` / `last_playlist_update_age`: Seconds since the last activity.
+- `upload_utilization`: How busy the upstream has been in the last utilization window.
+- `events`: Recent lifecycle messages (FFmpeg starts/stops, gap handling, etc.).
+- `last_ffmpeg_exit`: Exit code or signal for the previous FFmpeg process, if any.
+
+If no session is active, the endpoint returns `active: false` along with the most recent stream directories so you can inspect artifacts on disk.
 
 ## Creating a movie MP4
 
