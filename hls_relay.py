@@ -1,7 +1,8 @@
 # Typical start command: 
 # python -u hls_relay.py &> 20250119.log
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 from functools import wraps
+from collections import deque
 import os
 import threading
 import subprocess
@@ -27,6 +28,12 @@ MISSING_SEGMENT_TIMEOUT = 60
 
 # Timeout for skipping missing segments when new segments are arriving
 GAP_SKIP_TIMEOUT = 10
+
+# Sliding window (seconds) for measuring upload utilization
+UPLOAD_UTIL_WINDOW = 60
+
+# Maximum number of recent events to record per stream
+MAX_EVENT_HISTORY = 20
 
 app = Flask(__name__)
 
@@ -59,9 +66,15 @@ class StreamState:
         # Gap handling state
         self._gap_wait_seq = None
         self._gap_wait_start = None
+        self.finalized = False
+        self.upload_history = deque()
+        self.events = deque(maxlen=MAX_EVENT_HISTORY)
+        self.last_ffmpeg_exit = None
+        self.add_event("Stream state created")
+        self.ffmpeg_log_thread = None
 
     def initialize_playlist(self, init_sequence, init_segment_name):
-        print(f"Initializing playlist for stream {self.stream_id}")
+        print(f"Initializing playlist for stream {self.stream_id}", flush=True)
         with open(self.playlist_file, "w") as f:
             f.write("#EXTM3U\n")
             f.write("#EXT-X-VERSION:7\n")
@@ -71,14 +84,19 @@ class StreamState:
             f.write(f"#EXT-X-MAP:URI=\"{init_segment_name}\"\n")
         self.map_written = True
         self.last_playlist_sequence = init_sequence - 1
+        self.add_event(f"Playlist initialized at sequence {init_sequence}")
 
     def finalize_playlist(self):
-        print(f"Finalizing playlist for stream {self.stream_id}")
+        print(f"Finalizing playlist for stream {self.stream_id}", flush=True)
+        if self.finalized:
+            return
+        self.finalized = True
+        self.add_event("Playlist finalized")
         try:
             with open(self.playlist_file, "a") as f:
                 f.write("#EXT-X-ENDLIST\n")
         except Exception as e:
-            print(f"Error in finalize_playlist: {e}")
+            print(f"Error in finalize_playlist: {e}", flush=True)
         self.check_missing_segments_stop_event.set()
         self.check_missing_segments_started = False
 
@@ -93,7 +111,7 @@ class StreamState:
         while not self.check_missing_segments_stop_event.is_set():
             time.sleep(1)
             if time.time() - self.last_upload_time > MISSING_SEGMENT_TIMEOUT or time.time() - self.last_add_time > MISSING_SEGMENT_TIMEOUT:
-                print(f"Timeout for missing segments in stream {self.stream_dir}")
+                print(f"Timeout for missing segments in stream {self.stream_dir}", flush=True)
                 self.finalize_playlist()
                 break
 
@@ -162,8 +180,16 @@ class StreamState:
             raise ValueError(f"Unsupported target: {target}")
 
         start_desc = "edge" if live_start_index is None else str(live_start_index)
-        print(f"Starting ffmpeg relay for stream {stream_key} to target {target} with live_start_index {start_desc}")
-        self.ffmpeg_process = subprocess.Popen(ffmpeg_command)
+        print(f"Starting ffmpeg relay for stream {stream_key} to target {target} with live_start_index {start_desc}", flush=True)
+        self.ffmpeg_process = subprocess.Popen(
+            ffmpeg_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self._start_ffmpeg_logger()
+        self.add_event(f"ffmpeg started for {target} (start_index={start_desc})")
 
     def update_playlist(self):
         added = False
@@ -224,6 +250,7 @@ class StreamState:
                     self.written_segment_count += 1
                 self.last_playlist_sequence = next_seq
                 added = True
+                self.add_event(f"Skipped sequence {next_sequence}; resumed at {next_seq}")
                 # Reset or continue loop to handle more available sequences
                 self._gap_wait_seq = None
                 self._gap_wait_start = None
@@ -238,6 +265,38 @@ class StreamState:
         if 'final' in self.arrived_segments:
             self.finalize_playlist()
             del self.arrived_segments['final']
+
+    def record_upload_duration(self, duration):
+        now = time.time()
+        self.upload_history.append((now, duration))
+        cutoff = now - UPLOAD_UTIL_WINDOW
+        while self.upload_history and self.upload_history[0][0] < cutoff:
+            self.upload_history.popleft()
+
+    def add_event(self, message):
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        self.events.append({"time": timestamp, "message": message})
+
+    def _start_ffmpeg_logger(self):
+        if not self.ffmpeg_process or self.ffmpeg_process.stdout is None:
+            return
+        prefix = f"[ffmpeg {self.stream_id}] "
+
+        def _pump():
+            for line in self.ffmpeg_process.stdout:
+                print(prefix + line.rstrip(), flush=True)
+            try:
+                self.ffmpeg_process.stdout.close()
+            except Exception:
+                pass
+
+        self.ffmpeg_log_thread = threading.Thread(target=_pump, daemon=True)
+        self.ffmpeg_log_thread.start()
+
+    def _stop_ffmpeg_logger(self):
+        if self.ffmpeg_log_thread:
+            self.ffmpeg_log_thread.join(timeout=1)
+        self.ffmpeg_log_thread = None
 
 # Rest of the authentication code remains the same
 def check_auth(username, password):
@@ -261,10 +320,11 @@ def requires_auth(f):
 @app.route("/upload_segment", methods=["POST"])
 @requires_auth
 def upload_segment():
+    request_start = time.perf_counter()
     required_headers = ["Target", "Stream-Key", "Segment-Type", "Discontinuity", "Duration", "Sequence"]
     missing_headers = [header for header in required_headers if request.headers.get(header) is None]
     if missing_headers:
-        print(f"Missing headers: {', '.join(missing_headers)}")
+        print(f"Missing headers: {', '.join(missing_headers)}", flush=True)
         return f"Missing headers: {', '.join(missing_headers)}", 400
 
     try:
@@ -283,10 +343,47 @@ def upload_segment():
     if header_duration == 0 and not is_init:
         return "Zero-duration segment ignored.", 200
 
+    old_stream = None
     with stream_creation_lock:
-        if header_stream_key not in streams:
-            streams[header_stream_key] = StreamState(header_stream_key)
-        stream = streams[header_stream_key]
+        stream = streams.get(header_stream_key)
+        need_new_stream = False
+        if stream is None or stream.finalized:
+            need_new_stream = True
+        elif is_init and stream.map_written and header_sequence <= stream.last_playlist_sequence:
+            # Sequence number reset; treat as a brand new stream session
+            need_new_stream = True
+        if need_new_stream:
+            old_stream = stream
+            stream = StreamState(header_stream_key)
+            streams[header_stream_key] = stream
+        else:
+            streams[header_stream_key] = stream
+
+    if old_stream is not None:
+        old_stream.check_missing_segments_stop_event.set()
+        if old_stream.ffmpeg_process:
+                proc = old_stream.ffmpeg_process
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    exit_code = proc.returncode
+                    old_stream.add_event(f"ffmpeg exited with code {exit_code}")
+                    old_stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
+                except subprocess.TimeoutExpired:
+                    print(f"Warning: ffmpeg did not exit in time for old stream {old_stream.stream_id}; killing", flush=True)
+                    proc.kill()
+                    proc.wait()
+                    old_stream.add_event("ffmpeg killed after timeout")
+                    old_stream.last_ffmpeg_exit = {"code": None, "signal": "SIGKILL"}
+                except Exception as e:
+                    print(f"Warning: failed to terminate ffmpeg for old stream {old_stream.stream_id}: {e}", flush=True)
+                    old_stream.add_event(f"ffmpeg termination failed: {e}")
+                    old_stream.last_ffmpeg_exit = {"code": None, "signal": str(e)}
+                finally:
+                    old_stream.ffmpeg_process = None
+                    old_stream._stop_ffmpeg_logger()
+        if not old_stream.finalized:
+            old_stream.finalize_playlist()
 
     segment_name = f"p{stream.period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(stream.stream_dir, segment_name)
@@ -297,7 +394,7 @@ def upload_segment():
     except Exception as e:
         return f"Error saving segment: {e}", 500
     
-    print(f"Saved segment: {segment_name} for stream: {stream.stream_id}")
+    print(f"Saved segment: {segment_name} for stream: {stream.stream_id}", flush=True)
 
     stream.last_upload_time = time.time()
     # Start missing segments check thread
@@ -318,9 +415,11 @@ def upload_segment():
                     f.write("#EXT-X-DISCONTINUITY\n")
                     f.write(f"#EXT-X-MAP:URI=\"{segment_name}\"\n")
                 stream.period_index += 1
+                stream.add_event(f"New init segment (period {stream.period_index}) sequence {header_sequence}")
         # Drop stale media segments from queue (but keep file on disk)
         if (not is_init) and header_sequence <= stream.last_playlist_sequence:
-            print(f"Stale segment ignored for playlist: seq={header_sequence} (last={stream.last_playlist_sequence}) stream={stream.stream_id}")
+            print(f"Stale segment ignored for playlist: seq={header_sequence} (last={stream.last_playlist_sequence}) stream={stream.stream_id}", flush=True)
+            stream.add_event(f"Stale segment ignored: seq={header_sequence}")
         else:
             stream.arrived_segments[header_sequence] = {
                 "filename": segment_name,
@@ -335,11 +434,19 @@ def upload_segment():
 
         if stream.written_segment_count >= SEGMENTS_BEFORE_RELAY:
             if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
-                print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments")
+                print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments", flush=True)
                 stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=0)
             elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
-                print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge")
+                print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge", flush=True)
+                if stream.ffmpeg_process and stream.ffmpeg_process.poll() is not None:
+                    exit_code = stream.ffmpeg_process.returncode
+                    stream.add_event(f"ffmpeg exited with code {exit_code}")
+                    stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
+                    stream.ffmpeg_process = None
+                    stream._stop_ffmpeg_logger()
                 stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=None)
+
+        stream.record_upload_duration(time.perf_counter() - request_start)
 
     return "Segment uploaded", 200
 
@@ -371,7 +478,66 @@ def serve_segment(stream_id, segment_name):
 
     return Response(open(segment_path, "rb"), mimetype="video/mp4")
 
+
+@app.route("/status/<stream_key>")
+def stream_status(stream_key):
+    now = time.time()
+    with stream_creation_lock:
+        stream = streams.get(stream_key)
+
+    if stream is None:
+        status = {
+            "stream_key": stream_key,
+            "active": False,
+            "recent_stream_dirs": []
+        }
+        try:
+            for name in sorted(os.listdir(BASE_SEGMENTS_DIR), reverse=True):
+                if name.startswith(f"{stream_key}_"):
+                    status["recent_stream_dirs"].append(name)
+                if len(status["recent_stream_dirs"]) >= 5:
+                    break
+        except FileNotFoundError:
+            status["recent_stream_dirs"] = []
+        return jsonify(status)
+
+    with stream.playlist_lock:
+        pending_sequences = sorted(seq for seq in stream.arrived_segments.keys() if isinstance(seq, int))
+        has_finalize_flag = 'final' in stream.arrived_segments
+        upload_window_start = now - UPLOAD_UTIL_WINDOW
+        upload_active_seconds = sum(duration for ts, duration in stream.upload_history if ts >= upload_window_start)
+        last_seq = stream.last_playlist_sequence
+        info = {
+            "stream_key": stream.stream_key,
+            "stream_id": stream.stream_id,
+            "active": not stream.finalized,
+            "period_index": stream.period_index,
+            "map_written": stream.map_written,
+            "written_media_segments": stream.written_segment_count,
+            "last_playlist_sequence": last_seq,
+            "pending_sequences": pending_sequences,
+            "pending_count": len(pending_sequences),
+            "has_finalize_flag": has_finalize_flag,
+            "gap_wait_sequence": stream._gap_wait_seq,
+            "gap_wait_elapsed": None if stream._gap_wait_start is None else max(0.0, now - stream._gap_wait_start),
+            "upload_window_seconds": UPLOAD_UTIL_WINDOW,
+            "upload_active_seconds": upload_active_seconds,
+            "upload_utilization": min(1.0, upload_active_seconds / UPLOAD_UTIL_WINDOW) if UPLOAD_UTIL_WINDOW else None,
+            "upload_samples": len(stream.upload_history),
+            "events": list(stream.events),
+            "last_ffmpeg_exit": stream.last_ffmpeg_exit
+        }
+
+    info.update({
+        "last_upload_age": max(0.0, now - stream.last_upload_time),
+        "last_playlist_update_age": max(0.0, now - stream.last_add_time),
+        "ffmpeg_running": stream.ffmpeg_process is not None and stream.ffmpeg_process.poll() is None,
+        "segments_dir": stream.stream_dir,
+    })
+
+    return jsonify(info)
+
 if __name__ == "__main__":
     from waitress import serve
-    print(f"Starting production server with Waitress on http://0.0.0.0:{PORT}")
+    print(f"Starting production server with Waitress on http://0.0.0.0:{PORT}", flush=True)
     serve(app, host="0.0.0.0", port=PORT)
