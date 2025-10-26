@@ -241,8 +241,9 @@ class StreamState:
                 is_init = segment_info['is_init']
 
                 with open(self.playlist_file, "a") as f:
-                    f.write("#EXT-X-DISCONTINUITY\n")
+                    # Only write discontinuity for media segments, never for init segments
                     if not is_init:
+                        f.write("#EXT-X-DISCONTINUITY\n")
                         f.write(f"#EXTINF:{duration:.6f},\n")
                         f.write(f"{segment_name}\n")
 
