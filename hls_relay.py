@@ -480,8 +480,8 @@ def serve_segment(stream_id, segment_name):
     return Response(open(segment_path, "rb"), mimetype="video/mp4")
 
 
-@app.route("/status/<stream_key>")
-def stream_status(stream_key):
+def get_stream_status_data(stream_key):
+    """Helper function to gather stream status data"""
     now = time.time()
     with stream_creation_lock:
         stream = streams.get(stream_key)
@@ -500,7 +500,7 @@ def stream_status(stream_key):
                     break
         except FileNotFoundError:
             status["recent_stream_dirs"] = []
-        return jsonify(status)
+        return status
 
     with stream.playlist_lock:
         pending_sequences = sorted(seq for seq in stream.arrived_segments.keys() if isinstance(seq, int))
@@ -536,7 +536,297 @@ def stream_status(stream_key):
         "segments_dir": stream.stream_dir,
     })
 
-    return jsonify(info)
+    return info
+
+
+@app.route("/status/<stream_key>")
+def stream_status(stream_key):
+    """JSON status endpoint"""
+    return jsonify(get_stream_status_data(stream_key))
+
+
+@app.route("/status/<stream_key>/html")
+def stream_status_html(stream_key):
+    """HTML status page"""
+    data = get_stream_status_data(stream_key)
+    
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Status: {stream_key}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #f5f5f5;
+            color: #333;
+        }}
+        .container {{
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            margin-top: 0;
+            color: #1a1a1a;
+            border-bottom: 3px solid #007bff;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #444;
+            margin-top: 30px;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 8px;
+        }}
+        .status-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .status-item {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            border-left: 4px solid #007bff;
+        }}
+        .status-item label {{
+            display: block;
+            font-weight: 600;
+            color: #666;
+            font-size: 0.85em;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }}
+        .status-item .value {{
+            font-size: 1.2em;
+            color: #1a1a1a;
+        }}
+        .status-badge {{
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.9em;
+            font-weight: 600;
+        }}
+        .status-active {{
+            background: #28a745;
+            color: white;
+        }}
+        .status-inactive {{
+            background: #6c757d;
+            color: white;
+        }}
+        .status-running {{
+            background: #28a745;
+            color: white;
+        }}
+        .status-stopped {{
+            background: #dc3545;
+            color: white;
+        }}
+        .progress-bar {{
+            width: 100%;
+            height: 30px;
+            background: #e9ecef;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 8px;
+        }}
+        .progress-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, #007bff, #0056b3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 0.85em;
+            transition: width 0.3s ease;
+        }}
+        .events-list {{
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 15px;
+            max-height: 400px;
+            overflow-y: auto;
+        }}
+        .event-item {{
+            padding: 8px 0;
+            border-bottom: 1px solid #dee2e6;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }}
+        .event-item:last-child {{
+            border-bottom: none;
+        }}
+        .pending-sequences {{
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 15px 0;
+        }}
+        .recent-dirs {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+        }}
+        .recent-dirs ul {{
+            margin: 10px 0;
+            padding-left: 20px;
+        }}
+        .recent-dirs li {{
+            font-family: 'Courier New', monospace;
+            padding: 4px 0;
+        }}
+        .refresh-notice {{
+            text-align: center;
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #dee2e6;
+        }}
+        .refresh-notice a {{
+            color: #007bff;
+            text-decoration: none;
+        }}
+        .refresh-notice a:hover {{
+            text-decoration: underline;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Stream Status: {stream_key}</h1>
+"""
+    
+    if not data.get("active"):
+        html += f"""
+        <div class="status-item">
+            <label>Status</label>
+            <div class="value"><span class="status-badge status-inactive">INACTIVE</span></div>
+        </div>
+"""
+        if data.get("recent_stream_dirs"):
+            html += """
+        <h2>Recent Stream Sessions</h2>
+        <div class="recent-dirs">
+            <ul>
+"""
+            for dir_name in data["recent_stream_dirs"]:
+                html += f"                <li>{dir_name}</li>\n"
+            html += """
+            </ul>
+        </div>
+"""
+    else:
+        # Active stream
+        util_pct = int((data.get("upload_utilization", 0) or 0) * 100)
+        ffmpeg_status = "RUNNING" if data.get("ffmpeg_running") else "STOPPED"
+        ffmpeg_class = "status-running" if data.get("ffmpeg_running") else "status-stopped"
+        
+        html += f"""
+        <div class="status-grid">
+            <div class="status-item">
+                <label>Status</label>
+                <div class="value"><span class="status-badge status-active">ACTIVE</span></div>
+            </div>
+            <div class="status-item">
+                <label>FFmpeg</label>
+                <div class="value"><span class="status-badge {ffmpeg_class}">{ffmpeg_status}</span></div>
+            </div>
+            <div class="status-item">
+                <label>Stream ID</label>
+                <div class="value">{data.get('stream_id', 'N/A')}</div>
+            </div>
+            <div class="status-item">
+                <label>Media Segments Written</label>
+                <div class="value">{data.get('written_media_segments', 0)}</div>
+            </div>
+            <div class="status-item">
+                <label>Last Playlist Sequence</label>
+                <div class="value">{data.get('last_playlist_sequence', -1)}</div>
+            </div>
+            <div class="status-item">
+                <label>Period Index</label>
+                <div class="value">{data.get('period_index', 0)}</div>
+            </div>
+            <div class="status-item">
+                <label>Last Upload</label>
+                <div class="value">{data.get('last_upload_age', 0):.1f}s ago</div>
+            </div>
+            <div class="status-item">
+                <label>Last Playlist Update</label>
+                <div class="value">{data.get('last_playlist_update_age', 0):.1f}s ago</div>
+            </div>
+        </div>
+
+        <h2>Upload Utilization</h2>
+        <div class="progress-bar">
+            <div class="progress-fill" style="width: {util_pct}%;">{util_pct}%</div>
+        </div>
+        <p style="color: #666; font-size: 0.9em; margin-top: 8px;">
+            {data.get('upload_active_seconds', 0):.1f}s active in last {data.get('upload_window_seconds', 60)}s window 
+            ({data.get('upload_samples', 0)} samples)
+        </p>
+"""
+        
+        if data.get("pending_sequences"):
+            html += f"""
+        <div class="pending-sequences">
+            <strong>⚠️ Pending Sequences ({data.get('pending_count', 0)}):</strong> {', '.join(map(str, data['pending_sequences'][:20]))}
+        </div>
+"""
+        
+        if data.get("gap_wait_sequence") is not None:
+            html += f"""
+        <div class="pending-sequences">
+            <strong>⏳ Waiting for sequence {data['gap_wait_sequence']}</strong> 
+            ({data.get('gap_wait_elapsed', 0):.1f}s elapsed)
+        </div>
+"""
+        
+        if data.get("last_ffmpeg_exit"):
+            exit_info = data["last_ffmpeg_exit"]
+            exit_code = exit_info.get("code")
+            exit_signal = exit_info.get("signal")
+            exit_display = f"code {exit_code}" if exit_code is not None else f"signal {exit_signal}"
+            html += f"""
+        <div class="status-item" style="background: #fff3cd; border-left-color: #ffc107;">
+            <label>Last FFmpeg Exit</label>
+            <div class="value">{exit_display}</div>
+        </div>
+"""
+        
+        if data.get("events"):
+            html += """
+        <h2>Recent Events</h2>
+        <div class="events-list">
+"""
+            for event in reversed(data["events"]):
+                html += f"            <div class='event-item'>{event}</div>\n"
+            html += """
+        </div>
+"""
+    
+    html += f"""
+        <div class="refresh-notice">
+            <a href="/status/{stream_key}/html">Refresh</a> | 
+            <a href="/status/{stream_key}">View JSON</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    
+    return Response(html, mimetype="text/html")
 
 if __name__ == "__main__":
     from waitress import serve
