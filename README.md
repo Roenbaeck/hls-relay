@@ -102,16 +102,18 @@ curl -X POST http://localhost:8080/upload_segment \
 - `GET /segments/<stream_id>/playlist.m3u8`: Serve the HLS playlist (localhost only).
 - `GET /segments/<stream_id>/<segment_name>`: Serve individual segments (localhost only).
 - `GET /status/<stream_key>`: JSON status for the active stream and recent history.
+- `GET /status/<stream_key>/html`: Human-friendly HTML status page.
 
-### Status Endpoint
+### Status Endpoints
 
-The status endpoint is reachable from remote hosts and returns a JSON payload describing relay health for a given stream key. Example:
+The status endpoints are reachable from remote hosts and provide relay health information for a given stream key.
 
+#### JSON Status
 ```bash
 curl http://your-server:8080/status/YOUR_STREAM_KEY
 ```
 
-The response includes:
+The JSON response includes:
 - `active`: Whether the stream session is currently running.
 - `pending_sequences`: Media segments queued but not yet flushed to the playlist.
 - `last_upload_age` / `last_playlist_update_age`: Seconds since the last activity.
@@ -120,6 +122,14 @@ The response includes:
 - `last_ffmpeg_exit`: Exit code or signal for the previous FFmpeg process, if any.
 
 If no session is active, the endpoint returns `active: false` along with the most recent stream directories so you can inspect artifacts on disk.
+
+#### HTML Status
+Visit `http://your-server:8080/status/YOUR_STREAM_KEY/html` in a browser for a formatted status page with:
+- Color-coded status badges (active/inactive, FFmpeg running/stopped)
+- Upload utilization progress bar
+- Pending sequences and gap-wait warnings
+- Recent events log
+- Links to refresh or view JSON
 
 ## Creating a movie MP4
 
