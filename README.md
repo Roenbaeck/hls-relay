@@ -76,7 +76,7 @@ Edit the constants at the top of `hls_relay.py`:
 This server is designed for use with [Tubeist](https://github.com/Roenbaeck/tubeist), an iOS app available on the [App Store](https://apps.apple.com/us/app/tubeist/id6740208994). Tubeist handles segment uploads automatically for seamless live streaming to YouTube or Twitch.
 
 Alternatively, integrate directly via HTTP requests with the following headers:
-- `Target`: `youtube` or `twitch`
+- `Target`: `youtube`, `twitch`, or `passive` to only build the local HLS playlist (useful if OBS or another tool will pull it)
 - `Stream-Key`: Your platform's stream key
 - `Segment-Type`: `Initialization`, `Media`, or `Finalization`
 - `Discontinuity`: `true` or `false`
@@ -103,6 +103,77 @@ curl -X POST http://localhost:8080/upload_segment \
 - `GET /segments/<stream_id>/<segment_name>`: Serve individual segments (localhost only).
 - `GET /status/<stream_key>`: JSON status for the active stream and recent history.
 - `GET /status/<stream_key>/html`: Human-friendly HTML status page.
+ 
+### Passive / OBS Mode
+
+If you want to insert OBS (or another compositor) after the relay, set `Target: passive`. In passive mode:
+- Segments and playlist are still written under `segments/<stream_id>/`
+- No FFmpeg upload subprocess is started
+- You can point OBS's Media Source (or VLC Source) to `http://<server>:8080/segments/<stream_id>/playlist.m3u8` (ensure network access / firewall rules)
+- Status endpoints still work; `ffmpeg_running` will be false and an event will note passive mode
+
+Note: Pulling HLS into OBS adds latency (segment duration buffering) and re-encodes, which will drop Dolby Vision dynamic metadata—expect HDR10 base layer at best.
+
+### Force Target Override
+
+You can override the `Target` header provided by the client (useful when testing passive mode without updating the app) by either:
+
+Environment variable:
+```bash
+RELAY_FORCE_TARGET=passive python hls_relay.py
+```
+
+Or CLI flag:
+```bash
+python hls_relay.py --force-target passive
+```
+
+Accepted values include normal targets (`youtube`, `twitch`) or the passive one (`passive`). When `passive` is forced, no FFmpeg relay is started; segments and playlist are still written.
+
+## OBS Integration (Passive Mode & HDR Preview)
+
+You can use OBS as a downstream compositor/encoder by running the relay in passive mode (no upstream upload) and having OBS ingest the growing HLS playlist.
+
+### 1. Start relay in passive mode
+Use either the forced target override:
+```bash
+python hls_relay.py --force-target passive
+```
+or:
+```bash
+RELAY_FORCE_TARGET=passive python hls_relay.py
+```
+
+### 2. Get the stream folder
+When the first segment arrives you'll see a log line like:
+```
+Saved segment: p0_segment_000000.mp4 for stream: <stream_key>_YYYYMMDD_HHMMSS
+```
+The directory is `segments/<stream_key>_YYYYMMDD_HHMMSS/` and contains `playlist.m3u8` plus fragment files.
+
+### 3. Add the playlist to OBS
+You have two options:
+
+Option A (Local file on same machine):
+1. In OBS, click the `+` under Sources → choose `Media Source`.
+2. Select `Create New`, name it, click OK.
+3. Ensure `Local File` is checked.
+4. Click `Browse` and in the file chooser change the filter dropdown to `All Files` so `.m3u8` appears.
+5. Select the `playlist.m3u8` inside your stream folder.
+6. (Optional) Enable `Restart playback when source becomes active` for scene switching.
+
+Option B (HTTP URL):
+1. Start relay normally (still passive target).
+2. Use URL: `http://127.0.0.1:8080/segments/<stream_id>/playlist.m3u8` in a Media Source with `Local File` unchecked.
+
+HTTP ingestion is preferred if you later want remote OBS or to remove local filesystem coupling. Local file works for same-host quick tests.
+
+### 4. Enable HDR preview in OBS (macOS / OBS ≥ 32.0.2)
+Before adding the source, configure HDR:
+
+![OBS HDR Settings](OBS_HDR_Settings.png)
+
+Note that you need to restart OBS for the settings to take effect. You will need the Metal renderer for on-screen HDR.
 
 ### Status Endpoints
 

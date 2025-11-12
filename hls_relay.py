@@ -7,6 +7,8 @@ import os
 import threading
 import subprocess
 import time
+import sys
+import argparse
 from datetime import datetime
 
 # Set username and password for BASIC HTTP authentication for /upload_segment
@@ -34,6 +36,12 @@ UPLOAD_UTIL_WINDOW = 60
 
 # Maximum number of recent events to record per stream
 MAX_EVENT_HISTORY = 20
+
+# Targets that indicate we should only store segments and serve HLS locally (no relay)
+PASSIVE_TARGETS = {"passive"}
+
+# Optional forced target override (environment or CLI). If set, overrides incoming Target header.
+FORCE_TARGET = os.environ.get("RELAY_FORCE_TARGET", "").strip().lower() or None
 
 app = Flask(__name__)
 
@@ -329,7 +337,7 @@ def upload_segment():
         return f"Missing headers: {', '.join(missing_headers)}", 400
 
     try:
-        header_target = request.headers.get("Target")
+        header_target = request.headers.get("Target").lower()
         header_stream_key = request.headers.get("Stream-Key")
         header_segment_type = request.headers.get("Segment-Type")
         header_discontinuity = request.headers.get("Discontinuity").lower() == "true"
@@ -433,19 +441,29 @@ def upload_segment():
 
         stream.update_playlist()
 
-        if stream.written_segment_count >= SEGMENTS_BEFORE_RELAY:
+        # Apply forced target override if configured
+        effective_target = FORCE_TARGET if FORCE_TARGET else header_target
+        if FORCE_TARGET and not hasattr(stream, "_force_target_logged"):
+            stream.add_event(f"Force target override active: {FORCE_TARGET}")
+            setattr(stream, "_force_target_logged", True)
+
+        if effective_target not in PASSIVE_TARGETS:
+            if stream.written_segment_count >= SEGMENTS_BEFORE_RELAY:
+                if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
+                    print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments (target={effective_target})", flush=True)
+                    stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=0)
+                elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
+                    print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge (target={effective_target})", flush=True)
+                    if stream.ffmpeg_process and stream.ffmpeg_process.poll() is not None:
+                        exit_code = stream.ffmpeg_process.returncode
+                        stream.add_event(f"ffmpeg exited with code {exit_code}")
+                        stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
+                        stream.ffmpeg_process = None
+                        stream._stop_ffmpeg_logger()
+                    stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=None)
+        else:
             if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
-                print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments", flush=True)
-                stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=0)
-            elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
-                print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge", flush=True)
-                if stream.ffmpeg_process and stream.ffmpeg_process.poll() is not None:
-                    exit_code = stream.ffmpeg_process.returncode
-                    stream.add_event(f"ffmpeg exited with code {exit_code}")
-                    stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
-                    stream.ffmpeg_process = None
-                    stream._stop_ffmpeg_logger()
-                stream.start_ffmpeg_relay(header_target, header_stream_key, live_start_index=None)
+                stream.add_event(f"Passive mode: playlist building only (no relay). Target={effective_target}")
 
         stream.record_upload_duration(time.perf_counter() - request_start)
 
@@ -829,6 +847,13 @@ def stream_status_html(stream_key):
     return Response(html, mimetype="text/html")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="HLS Relay Server")
+    parser.add_argument("--force-target", dest="force_target", help="Override Target header (e.g. youtube, twitch, passive)")
+    args = parser.parse_args()
+    if args.force_target:
+        FORCE_TARGET = args.force_target.strip().lower()
+        print(f"Force target override set to: {FORCE_TARGET}", flush=True)
+
     from waitress import serve
     print(f"Starting production server with Waitress on http://0.0.0.0:{PORT}", flush=True)
     serve(app, host="0.0.0.0", port=PORT)
