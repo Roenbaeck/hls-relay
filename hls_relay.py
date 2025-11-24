@@ -52,6 +52,21 @@ os.makedirs(BASE_SEGMENTS_DIR, exist_ok=True)
 stream_creation_lock = threading.Lock()
 streams = {}
 
+def find_latest_stream_dir(stream_key):
+    try:
+        candidates = []
+        for name in os.listdir(BASE_SEGMENTS_DIR):
+            if name.startswith(f"{stream_key}_"):
+                candidates.append(name)
+        if not candidates:
+            return None
+        # Sort by timestamp in the name (assuming format key_YYYYMMDD_HHMMSS)
+        candidates.sort(reverse=True)
+        return os.path.join(BASE_SEGMENTS_DIR, candidates[0])
+    except FileNotFoundError:
+        return None
+
+
 class StreamState:
     def __init__(self, stream_key):
         self.stream_key = stream_key
@@ -302,6 +317,72 @@ class StreamState:
         self.ffmpeg_log_thread = threading.Thread(target=_pump, daemon=True)
         self.ffmpeg_log_thread.start()
 
+    @classmethod
+    def restore(cls, stream_key, stream_dir):
+        # Create instance but avoid creating a new directory if possible
+        # Since __init__ creates a dir, we let it do so and then cleanup
+        instance = cls(stream_key)
+        
+        # Cleanup the accidentally created new dir
+        if os.path.exists(instance.stream_dir) and instance.stream_dir != stream_dir:
+            try:
+                os.rmdir(instance.stream_dir)
+            except OSError:
+                pass
+
+        instance.stream_dir = stream_dir
+        instance.stream_id = os.path.basename(stream_dir)
+        try:
+            instance.timestamp = instance.stream_id.split('_', 1)[1]
+        except IndexError:
+            pass # Keep default or handle error
+            
+        instance.playlist_file = os.path.join(instance.stream_dir, "playlist.m3u8")
+        
+        # Restore state from playlist/files
+        max_seq = -1
+        period_index = 0
+        segment_count = 0
+        
+        if os.path.exists(instance.playlist_file):
+            with open(instance.playlist_file, "r") as f:
+                lines = f.readlines()
+            
+            # Remove ENDLIST
+            new_lines = [l for l in lines if not l.strip().startswith("#EXT-X-ENDLIST")]
+            if len(new_lines) != len(lines):
+                with open(instance.playlist_file, "w") as f:
+                    f.writelines(new_lines)
+                instance.add_event("Removed #EXT-X-ENDLIST to resume stream")
+
+            for line in lines:
+                line = line.strip()
+                if line.endswith(".mp4") or line.endswith(".m4s"):
+                    # Parse filename: p0_segment_000000.m4s
+                    try:
+                        parts = line.split('_')
+                        if len(parts) >= 3 and parts[0].startswith('p'):
+                            p_idx = int(parts[0][1:])
+                            period_index = max(period_index, p_idx)
+                            
+                            seq_part = parts[-1].split('.')[0]
+                            seq = int(seq_part)
+                            max_seq = max(max_seq, seq)
+                            
+                            if not line.endswith(".mp4"): # Count media segments
+                                segment_count += 1
+                    except (ValueError, IndexError):
+                        pass
+
+        instance.last_playlist_sequence = max_seq
+        instance.period_index = period_index
+        instance.written_segment_count = segment_count
+        instance.map_written = True
+        instance.just_restored = True
+        instance.add_event(f"Restored stream state. Last seq: {max_seq}")
+        
+        return instance
+
     def _stop_ffmpeg_logger(self):
         if self.ffmpeg_log_thread:
             self.ffmpeg_log_thread.join(timeout=1)
@@ -363,7 +444,34 @@ def upload_segment():
             need_new_stream = True
         if need_new_stream:
             old_stream = stream
-            stream = StreamState(header_stream_key)
+            
+            # Check if we can resume an existing stream
+            latest_dir = find_latest_stream_dir(header_stream_key)
+            restored = False
+            if latest_dir:
+                # Create a temporary instance just to check the last sequence? 
+                # Or just trust that if we found a dir, we should check it.
+                # We'll use the restore method but we need to know if it's valid to restore.
+                # We can't easily check the last sequence without parsing. 
+                # Let's optimistically restore and then check sequence.
+                # If sequence is not greater, we might have to discard the restored one?
+                # Actually, if header_sequence <= last_sequence, it's a reset anyway (handled above for active streams).
+                # But here the stream was None or finalized.
+                
+                # Let's peek at the file first to be safe, or just restore and check.
+                # Restoring is cheap enough.
+                candidate_stream = StreamState.restore(header_stream_key, latest_dir)
+                if header_sequence > candidate_stream.last_playlist_sequence:
+                    stream = candidate_stream
+                    restored = True
+                else:
+                    # Not a continuation, so it's a new stream (reset)
+                    # candidate_stream is discarded (garbage collected)
+                    pass
+            
+            if not restored:
+                stream = StreamState(header_stream_key)
+            
             streams[header_stream_key] = stream
         else:
             streams[header_stream_key] = stream
@@ -452,6 +560,15 @@ def upload_segment():
                 if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
                     print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments (target={effective_target})", flush=True)
                     stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=0)
+                elif getattr(stream, 'just_restored', False):
+                    # Resume from the segment that triggered the restore (the current one)
+                    # live_start_index is 0-based index of the segment in the playlist.
+                    # written_segment_count includes the current segment.
+                    # So index = count - 1.
+                    start_index = max(0, stream.written_segment_count - 1)
+                    print(f"Resuming ffmpeg for stream {stream.stream_id} at index {start_index} (target={effective_target})", flush=True)
+                    stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=start_index)
+                    stream.just_restored = False
                 elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
                     print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge (target={effective_target})", flush=True)
                     if stream.ffmpeg_process and stream.ffmpeg_process.poll() is not None:
