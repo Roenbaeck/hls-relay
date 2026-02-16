@@ -60,6 +60,8 @@ def sanitize_key(key):
     Security: Restrict stream_key to safe characters to prevent path traversal.
     Removes any characters that aren't alphanumeric, underscore, or dash.
     """
+    if key is None:
+        return ""
     return re.sub(r'[^\w-]', '', key)
 
 def find_latest_stream_dir(stream_key):
@@ -102,6 +104,7 @@ class StreamState:
         self.finalized = False
         self.last_ffmpeg_exit = None
         self.ffmpeg_log_thread = None
+        self.just_restored = False  # Initialize for all instances
 
         if is_restore and stream_dir:
             # Restore existing stream
@@ -589,6 +592,10 @@ def serve_playlist(stream_id):
     if request.remote_addr not in ('127.0.0.1', '::1'):
         return "Access denied", 403
 
+    # Security: Prevent path traversal in stream_id
+    if ".." in stream_id or stream_id.startswith("/"):
+        return "Invalid stream ID", 400
+
     playlist_file = os.path.join(BASE_SEGMENTS_DIR, stream_id, "playlist.m3u8")
 
     if not os.path.exists(playlist_file):
@@ -606,7 +613,9 @@ def serve_segment(stream_id, segment_name):
     if request.remote_addr not in ('127.0.0.1', '::1'):
         return "Access denied", 403
 
-    # Security: Prevent path traversal in segment name
+    # Security: Prevent path traversal in stream_id and segment name
+    if ".." in stream_id or stream_id.startswith("/"):
+        return "Invalid stream ID", 400
     if ".." in segment_name or segment_name.startswith("/"):
         return "Invalid segment name", 400
 
@@ -615,7 +624,12 @@ def serve_segment(stream_id, segment_name):
     if not os.path.exists(segment_path):
         return "Segment not found", 404
 
-    return Response(open(segment_path, "rb"), mimetype="video/mp4")
+    # Use context manager to ensure file is properly closed
+    def generate():
+        with open(segment_path, "rb") as f:
+            yield f.read()
+    
+    return Response(generate(), mimetype="video/mp4")
 
 
 def get_stream_status_data(stream_key):
