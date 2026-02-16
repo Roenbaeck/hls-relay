@@ -9,7 +9,9 @@ import subprocess
 import time
 import sys
 import argparse
+import re
 from datetime import datetime
+from werkzeug.utils import secure_filename
 
 # Set username and password for BASIC HTTP authentication for /upload_segment
 AUTH_USERNAME = 'brute'
@@ -52,11 +54,19 @@ os.makedirs(BASE_SEGMENTS_DIR, exist_ok=True)
 stream_creation_lock = threading.Lock()
 streams = {}
 
+def sanitize_key(key):
+    """
+    Security: Restrict stream_key to safe characters to prevent path traversal.
+    Removes any characters that aren't alphanumeric, underscore, or dash.
+    """
+    return re.sub(r'[^\w-]', '', key)
+
 def find_latest_stream_dir(stream_key):
+    safe_key = sanitize_key(stream_key)
     try:
         candidates = []
         for name in os.listdir(BASE_SEGMENTS_DIR):
-            if name.startswith(f"{stream_key}_"):
+            if name.startswith(f"{safe_key}_"):
                 candidates.append(name)
         if not candidates:
             return None
@@ -68,16 +78,15 @@ def find_latest_stream_dir(stream_key):
 
 
 class StreamState:
-    def __init__(self, stream_key):
-        self.stream_key = stream_key
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.stream_id = f"{stream_key}_{self.timestamp}"
-        self.stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{self.stream_id}")
-        os.makedirs(self.stream_dir, exist_ok=True)
-        self.playlist_file = os.path.join(self.stream_dir, "playlist.m3u8")
+    def __init__(self, stream_key, stream_dir=None, is_restore=False):
+        self.stream_key = sanitize_key(stream_key)
+        self.events = deque(maxlen=MAX_EVENT_HISTORY)
+        self.upload_history = deque()
+        
+        # State variables
         self.playlist_lock = threading.Lock()
         self.arrived_segments = {}  # Dictionary to store arrived segments, key=sequence
-        self.last_playlist_sequence = -1 # Track the last sequence added to the playlist
+        self.last_playlist_sequence = -1  # Track the last sequence added to the playlist
         self.map_written = False
         self.written_segment_count = 0
         self.ffmpeg_process = None
@@ -90,11 +99,71 @@ class StreamState:
         self._gap_wait_seq = None
         self._gap_wait_start = None
         self.finalized = False
-        self.upload_history = deque()
-        self.events = deque(maxlen=MAX_EVENT_HISTORY)
         self.last_ffmpeg_exit = None
-        self.add_event("Stream state created")
         self.ffmpeg_log_thread = None
+
+        if is_restore and stream_dir:
+            # Restore existing stream
+            self.stream_dir = stream_dir
+            self.stream_id = os.path.basename(stream_dir)
+            try:
+                # Extract timestamp from ID
+                self.timestamp = self.stream_id.split('_', 1)[1]
+            except IndexError:
+                self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.playlist_file = os.path.join(self.stream_dir, "playlist.m3u8")
+            self._restore_state()
+            self.add_event("Stream state restored")
+        else:
+            # Create new stream
+            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.stream_id = f"{self.stream_key}_{self.timestamp}"
+            self.stream_dir = os.path.join(BASE_SEGMENTS_DIR, self.stream_id)
+            os.makedirs(self.stream_dir, exist_ok=True)
+            self.playlist_file = os.path.join(self.stream_dir, "playlist.m3u8")
+            self.add_event("Stream state created")
+
+    def _restore_state(self):
+        """Restore state from existing playlist file."""
+        max_seq = -1
+        period_index = 0
+        segment_count = 0
+        
+        if os.path.exists(self.playlist_file):
+            with open(self.playlist_file, "r") as f:
+                lines = f.readlines()
+            
+            # Remove ENDLIST if present to allow resumption
+            new_lines = [l for l in lines if not l.strip().startswith("#EXT-X-ENDLIST")]
+            if len(new_lines) != len(lines):
+                with open(self.playlist_file, "w") as f:
+                    f.writelines(new_lines)
+                self.add_event("Removed #EXT-X-ENDLIST to resume stream")
+
+            for line in lines:
+                line = line.strip()
+                if line.endswith(".mp4") or line.endswith(".m4s"):
+                    # Parse filename: p0_segment_000000.m4s
+                    try:
+                        parts = line.split('_')
+                        if len(parts) >= 3 and parts[0].startswith('p'):
+                            p_idx = int(parts[0][1:])
+                            period_index = max(period_index, p_idx)
+                            
+                            seq_part = parts[-1].split('.')[0]
+                            seq = int(seq_part)
+                            max_seq = max(max_seq, seq)
+                            
+                            if not line.endswith(".mp4"):  # Count media segments
+                                segment_count += 1
+                    except (ValueError, IndexError):
+                        pass
+
+        self.last_playlist_sequence = max_seq
+        self.period_index = period_index
+        self.written_segment_count = segment_count
+        self.map_written = True
+        self.just_restored = True
 
     def initialize_playlist(self, init_sequence, init_segment_name):
         print(f"Initializing playlist for stream {self.stream_id}", flush=True)
@@ -122,6 +191,9 @@ class StreamState:
             print(f"Error in finalize_playlist: {e}", flush=True)
         self.check_missing_segments_stop_event.set()
         self.check_missing_segments_started = False
+
+        # Stop ffmpeg
+        self._stop_ffmpeg()
 
         # Remove this finished stream from the global streams dictionary
         global streams
@@ -317,76 +389,32 @@ class StreamState:
         self.ffmpeg_log_thread = threading.Thread(target=_pump, daemon=True)
         self.ffmpeg_log_thread.start()
 
-    @classmethod
-    def restore(cls, stream_key, stream_dir):
-        # Create instance but avoid creating a new directory if possible
-        # Since __init__ creates a dir, we let it do so and then cleanup
-        instance = cls(stream_key)
-        
-        # Cleanup the accidentally created new dir
-        if os.path.exists(instance.stream_dir) and instance.stream_dir != stream_dir:
-            try:
-                os.rmdir(instance.stream_dir)
-            except OSError:
-                pass
-
-        instance.stream_dir = stream_dir
-        instance.stream_id = os.path.basename(stream_dir)
-        try:
-            instance.timestamp = instance.stream_id.split('_', 1)[1]
-        except IndexError:
-            pass # Keep default or handle error
-            
-        instance.playlist_file = os.path.join(instance.stream_dir, "playlist.m3u8")
-        
-        # Restore state from playlist/files
-        max_seq = -1
-        period_index = 0
-        segment_count = 0
-        
-        if os.path.exists(instance.playlist_file):
-            with open(instance.playlist_file, "r") as f:
-                lines = f.readlines()
-            
-            # Remove ENDLIST
-            new_lines = [l for l in lines if not l.strip().startswith("#EXT-X-ENDLIST")]
-            if len(new_lines) != len(lines):
-                with open(instance.playlist_file, "w") as f:
-                    f.writelines(new_lines)
-                instance.add_event("Removed #EXT-X-ENDLIST to resume stream")
-
-            for line in lines:
-                line = line.strip()
-                if line.endswith(".mp4") or line.endswith(".m4s"):
-                    # Parse filename: p0_segment_000000.m4s
-                    try:
-                        parts = line.split('_')
-                        if len(parts) >= 3 and parts[0].startswith('p'):
-                            p_idx = int(parts[0][1:])
-                            period_index = max(period_index, p_idx)
-                            
-                            seq_part = parts[-1].split('.')[0]
-                            seq = int(seq_part)
-                            max_seq = max(max_seq, seq)
-                            
-                            if not line.endswith(".mp4"): # Count media segments
-                                segment_count += 1
-                    except (ValueError, IndexError):
-                        pass
-
-        instance.last_playlist_sequence = max_seq
-        instance.period_index = period_index
-        instance.written_segment_count = segment_count
-        instance.map_written = True
-        instance.just_restored = True
-        instance.add_event(f"Restored stream state. Last seq: {max_seq}")
-        
-        return instance
-
     def _stop_ffmpeg_logger(self):
         if self.ffmpeg_log_thread:
             self.ffmpeg_log_thread.join(timeout=1)
         self.ffmpeg_log_thread = None
+
+    def _stop_ffmpeg(self):
+        """Stop the ffmpeg process gracefully or forcefully if needed."""
+        if self.ffmpeg_process:
+            proc = self.ffmpeg_process
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                self.add_event(f"ffmpeg exited with code {proc.returncode}")
+                self.last_ffmpeg_exit = {"code": proc.returncode, "signal": None}
+            except subprocess.TimeoutExpired:
+                print(f"Warning: ffmpeg did not exit in time for {self.stream_id}; killing", flush=True)
+                proc.kill()
+                proc.wait()
+                self.add_event("ffmpeg killed after timeout")
+                self.last_ffmpeg_exit = {"code": None, "signal": "SIGKILL"}
+            except Exception as e:
+                print(f"Warning: failed to terminate ffmpeg: {e}", flush=True)
+            finally:
+                self.ffmpeg_process = None
+                if self.ffmpeg_log_thread:
+                    self._stop_ffmpeg_logger()
 
 # Rest of the authentication code remains the same
 def check_auth(username, password):
@@ -419,7 +447,8 @@ def upload_segment():
 
     try:
         header_target = request.headers.get("Target").lower()
-        header_stream_key = request.headers.get("Stream-Key")
+        # Security: Sanitize stream key immediately
+        header_stream_key = sanitize_key(request.headers.get("Stream-Key"))
         header_segment_type = request.headers.get("Segment-Type")
         header_discontinuity = request.headers.get("Discontinuity").lower() == "true"
         header_duration = float(request.headers.get("Duration"))
@@ -437,70 +466,42 @@ def upload_segment():
     with stream_creation_lock:
         stream = streams.get(header_stream_key)
         need_new_stream = False
+        
         if stream is None or stream.finalized:
             need_new_stream = True
         elif is_init and stream.map_written and header_sequence <= stream.last_playlist_sequence:
             # Sequence number reset; treat as a brand new stream session
             need_new_stream = True
+            
         if need_new_stream:
             old_stream = stream
             
-            # Check if we can resume an existing stream
+            # Check for restore
             latest_dir = find_latest_stream_dir(header_stream_key)
             restored = False
+            
             if latest_dir:
-                # Create a temporary instance just to check the last sequence? 
-                # Or just trust that if we found a dir, we should check it.
-                # We'll use the restore method but we need to know if it's valid to restore.
-                # We can't easily check the last sequence without parsing. 
-                # Let's optimistically restore and then check sequence.
-                # If sequence is not greater, we might have to discard the restored one?
-                # Actually, if header_sequence <= last_sequence, it's a reset anyway (handled above for active streams).
-                # But here the stream was None or finalized.
-                
-                # Let's peek at the file first to be safe, or just restore and check.
-                # Restoring is cheap enough.
-                candidate_stream = StreamState.restore(header_stream_key, latest_dir)
+                # Create instance in restore mode
+                candidate_stream = StreamState(header_stream_key, stream_dir=latest_dir, is_restore=True)
                 if header_sequence > candidate_stream.last_playlist_sequence:
                     stream = candidate_stream
                     restored = True
-                else:
-                    # Not a continuation, so it's a new stream (reset)
-                    # candidate_stream is discarded (garbage collected)
-                    pass
             
             if not restored:
-                stream = StreamState(header_stream_key)
+                stream = StreamState(header_stream_key)  # New stream creation
             
             streams[header_stream_key] = stream
-        else:
-            streams[header_stream_key] = stream
 
+    # Cleanup old stream if replaced
     if old_stream is not None:
-        old_stream.check_missing_segments_stop_event.set()
-        if old_stream.ffmpeg_process:
-                proc = old_stream.ffmpeg_process
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    exit_code = proc.returncode
-                    old_stream.add_event(f"ffmpeg exited with code {exit_code}")
-                    old_stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
-                except subprocess.TimeoutExpired:
-                    print(f"Warning: ffmpeg did not exit in time for old stream {old_stream.stream_id}; killing", flush=True)
-                    proc.kill()
-                    proc.wait()
-                    old_stream.add_event("ffmpeg killed after timeout")
-                    old_stream.last_ffmpeg_exit = {"code": None, "signal": "SIGKILL"}
-                except Exception as e:
-                    print(f"Warning: failed to terminate ffmpeg for old stream {old_stream.stream_id}: {e}", flush=True)
-                    old_stream.add_event(f"ffmpeg termination failed: {e}")
-                    old_stream.last_ffmpeg_exit = {"code": None, "signal": str(e)}
-                finally:
-                    old_stream.ffmpeg_process = None
-                    old_stream._stop_ffmpeg_logger()
+        # Ensure the old stream is finalized and ffmpeg stopped
         if not old_stream.finalized:
             old_stream.finalize_playlist()
+        # The finalize_playlist method already handles ffmpeg termination,
+        # but we call _stop_ffmpeg explicitly here to ensure cleanup happens
+        # immediately if logic flow changes or finalize wasn't called.
+        if old_stream.ffmpeg_process:
+            old_stream._stop_ffmpeg()
 
     segment_name = f"p{stream.period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(stream.stream_dir, segment_name)
@@ -588,10 +589,11 @@ def upload_segment():
 
 @app.route("/segments/<stream_id>/playlist.m3u8")
 def serve_playlist(stream_id):
-    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
+    # Security: Only allow localhost to prevent external leeching
+    if request.remote_addr not in ('127.0.0.1', '::1'):
         return "Access denied", 403
 
-    playlist_file = os.path.join("segments", stream_id, "playlist.m3u8")
+    playlist_file = os.path.join(BASE_SEGMENTS_DIR, stream_id, "playlist.m3u8")
 
     if not os.path.exists(playlist_file):
         return "Stream not found", 404
@@ -604,10 +606,15 @@ def serve_playlist(stream_id):
 
 @app.route("/segments/<stream_id>/<segment_name>")
 def serve_segment(stream_id, segment_name):
-    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
+    # Security: Only allow localhost to prevent external leeching
+    if request.remote_addr not in ('127.0.0.1', '::1'):
         return "Access denied", 403
 
-    segment_path = os.path.join("segments", stream_id, segment_name)
+    # Security: Prevent path traversal in segment name
+    if ".." in segment_name or segment_name.startswith("/"):
+        return "Invalid segment name", 400
+
+    segment_path = os.path.join(BASE_SEGMENTS_DIR, stream_id, segment_name)
 
     if not os.path.exists(segment_path):
         return "Segment not found", 404
@@ -617,19 +624,21 @@ def serve_segment(stream_id, segment_name):
 
 def get_stream_status_data(stream_key):
     """Helper function to gather stream status data"""
+    # Security: Sanitize stream key
+    safe_key = sanitize_key(stream_key)
     now = time.time()
     with stream_creation_lock:
-        stream = streams.get(stream_key)
+        stream = streams.get(safe_key)
 
     if stream is None:
         status = {
-            "stream_key": stream_key,
+            "stream_key": safe_key,
             "active": False,
             "recent_stream_dirs": []
         }
         try:
             for name in sorted(os.listdir(BASE_SEGMENTS_DIR), reverse=True):
-                if name.startswith(f"{stream_key}_"):
+                if name.startswith(f"{safe_key}_"):
                     status["recent_stream_dirs"].append(name)
                 if len(status["recent_stream_dirs"]) >= 5:
                     break
