@@ -64,6 +64,15 @@ def sanitize_key(key):
         return ""
     return re.sub(r'[^\w-]', '', key)
 
+def validate_path_component(component, component_name="path component"):
+    """
+    Security: Validate that a path component doesn't contain path traversal sequences.
+    Returns (is_valid, error_message) tuple.
+    """
+    if ".." in component or component.startswith("/"):
+        return False, f"Invalid {component_name}", 400
+    return True, None, None
+
 def find_latest_stream_dir(stream_key):
     safe_key = sanitize_key(stream_key)
     try:
@@ -593,8 +602,9 @@ def serve_playlist(stream_id):
         return "Access denied", 403
 
     # Security: Prevent path traversal in stream_id
-    if ".." in stream_id or stream_id.startswith("/"):
-        return "Invalid stream ID", 400
+    is_valid, error_msg, status_code = validate_path_component(stream_id, "stream ID")
+    if not is_valid:
+        return error_msg, status_code
 
     playlist_file = os.path.join(BASE_SEGMENTS_DIR, stream_id, "playlist.m3u8")
 
@@ -614,10 +624,12 @@ def serve_segment(stream_id, segment_name):
         return "Access denied", 403
 
     # Security: Prevent path traversal in stream_id and segment name
-    if ".." in stream_id or stream_id.startswith("/"):
-        return "Invalid stream ID", 400
-    if ".." in segment_name or segment_name.startswith("/"):
-        return "Invalid segment name", 400
+    is_valid, error_msg, status_code = validate_path_component(stream_id, "stream ID")
+    if not is_valid:
+        return error_msg, status_code
+    is_valid, error_msg, status_code = validate_path_component(segment_name, "segment name")
+    if not is_valid:
+        return error_msg, status_code
 
     segment_path = os.path.join(BASE_SEGMENTS_DIR, stream_id, segment_name)
 
@@ -625,9 +637,11 @@ def serve_segment(stream_id, segment_name):
         return "Segment not found", 404
 
     # Use context manager to ensure file is properly closed
+    # Stream in chunks to avoid loading entire file into memory
     def generate():
         with open(segment_path, "rb") as f:
-            yield f.read()
+            while chunk := f.read(8192):
+                yield chunk
     
     return Response(generate(), mimetype="video/mp4")
 
