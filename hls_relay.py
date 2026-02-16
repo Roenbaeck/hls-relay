@@ -11,6 +11,7 @@ import sys
 import argparse
 import re
 from datetime import datetime
+# Note: werkzeug available for additional security utilities if needed in future
 from werkzeug.utils import secure_filename
 
 # Set username and password for BASIC HTTP authentication for /upload_segment
@@ -494,14 +495,9 @@ def upload_segment():
 
     # Cleanup old stream if replaced
     if old_stream is not None:
-        # Ensure the old stream is finalized and ffmpeg stopped
+        # Ensure the old stream is finalized (this will also stop ffmpeg)
         if not old_stream.finalized:
             old_stream.finalize_playlist()
-        # The finalize_playlist method already handles ffmpeg termination,
-        # but we call _stop_ffmpeg explicitly here to ensure cleanup happens
-        # immediately if logic flow changes or finalize wasn't called.
-        if old_stream.ffmpeg_process:
-            old_stream._stop_ffmpeg()
 
     segment_name = f"p{stream.period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(stream.stream_dir, segment_name)
