@@ -24,18 +24,22 @@ class TestRequestValidation(unittest.TestCase):
             hls_relay.streams.clear()
         shutil.rmtree(self.test_dir)
 
-    def upload(self, stream_key, segment_type, sequence, duration, data=b'data'):
+    def upload(self, stream_key, segment_type, sequence, duration, data=b'data', stream_id=None):
+        headers = {
+            **self.auth_headers,
+            'Target': 'passive',
+            'Stream-Key': stream_key,
+            'Segment-Type': segment_type,
+            'Discontinuity': 'false',
+            'Duration': str(duration),
+            'Sequence': str(sequence),
+        }
+        if stream_id is not None:
+            headers['Stream-ID'] = stream_id
+
         return self.client.post(
             '/upload_segment',
-            headers={
-                **self.auth_headers,
-                'Target': 'passive',
-                'Stream-Key': stream_key,
-                'Segment-Type': segment_type,
-                'Discontinuity': 'false',
-                'Duration': str(duration),
-                'Sequence': str(sequence),
-            },
+            headers=headers,
             data=data,
             environ_overrides={'REMOTE_ADDR': '127.0.0.1'},
         )
@@ -45,6 +49,12 @@ class TestRequestValidation(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_data(as_text=True), 'Invalid Stream-Key')
+
+    def test_invalid_stream_id_is_rejected(self):
+        response = self.upload('valid_key', 'Initialization', 0, 0, data=b'init', stream_id='bad/id')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_data(as_text=True), 'Invalid Stream-ID')
 
     def test_zero_duration_finalization_closes_playlist(self):
         self.assertEqual(self.upload('finalize_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
@@ -84,6 +94,42 @@ class TestRequestValidation(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_data(as_text=True), 'Invalid segment name')
+
+    def test_old_client_does_not_resume_without_stream_id(self):
+        self.assertEqual(self.upload('legacy_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
+        self.assertEqual(self.upload('legacy_key', 'Media', 1, 2.0, data=b'media').status_code, 200)
+        self.assertEqual(self.upload('legacy_key', 'Finalization', 2, 0, data=b'').status_code, 200)
+
+        response = self.upload('legacy_key', 'Media', 3, 2.0, data=b'late')
+
+        self.assertEqual(response.status_code, 200)
+        stream_dirs = sorted(os.listdir(self.test_dir))
+        self.assertEqual(len(stream_dirs), 2)
+        self.assertNotEqual(stream_dirs[0], stream_dirs[1])
+
+        with hls_relay.stream_creation_lock:
+            stream = hls_relay.streams.get('legacy_key')
+            self.assertIsNotNone(stream)
+            self.assertEqual(stream.last_playlist_sequence, -1)
+            self.assertFalse(stream.just_restored)
+
+    def test_stream_id_resumes_exact_matching_stream(self):
+        stream_id = '20260425_150000'
+        self.assertEqual(self.upload('resume_key', 'Initialization', 0, 0, data=b'init', stream_id=stream_id).status_code, 200)
+        self.assertEqual(self.upload('resume_key', 'Media', 1, 2.0, data=b'media', stream_id=stream_id).status_code, 200)
+        self.assertEqual(self.upload('resume_key', 'Finalization', 2, 0, data=b'', stream_id=stream_id).status_code, 200)
+
+        response = self.upload('resume_key', 'Media', 3, 2.0, data=b'late', stream_id=stream_id)
+
+        self.assertEqual(response.status_code, 200)
+        stream_dirs = os.listdir(self.test_dir)
+        self.assertEqual(stream_dirs, [f'resume_key_{stream_id}'])
+
+        with hls_relay.stream_creation_lock:
+            stream = hls_relay.streams.get('resume_key')
+            self.assertIsNotNone(stream)
+            self.assertEqual(stream.stream_id, f'resume_key_{stream_id}')
+            self.assertTrue(stream.just_restored)
 
 
 if __name__ == '__main__':

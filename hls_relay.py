@@ -60,6 +60,12 @@ def is_valid_stream_key(stream_key):
     return re.fullmatch(r"[A-Za-z0-9_-]+", stream_key) is not None
 
 
+def is_valid_stream_id(stream_id):
+    if not stream_id:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9_-]+", stream_id) is not None
+
+
 def validate_path_component(component, component_name="path component"):
     if not component or component in {".", ".."}:
         return False, f"Invalid {component_name}", 400
@@ -82,8 +88,19 @@ def find_latest_stream_dir(stream_key):
         return None
 
 
+def find_stream_dir(stream_key, stream_id):
+    stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{stream_key}_{stream_id}")
+    if os.path.isdir(stream_dir):
+        return stream_dir
+    return None
+
+
+def generate_server_stream_id():
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
 class StreamState:
-    def __init__(self, stream_key, stream_dir=None, is_restore=False):
+    def __init__(self, stream_key, stream_dir=None, is_restore=False, stream_id=None):
         self.stream_key = stream_key
         self.playlist_lock = threading.Lock()
         self.arrived_segments = {}  # Dictionary to store arrived segments, key=sequence
@@ -112,12 +129,12 @@ class StreamState:
             try:
                 self.timestamp = self.stream_id.split('_', 1)[1]
             except IndexError:
-                self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.timestamp = generate_server_stream_id()
             self.playlist_file = os.path.join(self.stream_dir, "playlist.m3u8")
             self._restore_state()
             self.add_event("Stream state restored")
         else:
-            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.timestamp = stream_id or generate_server_stream_id()
             self.stream_id = f"{stream_key}_{self.timestamp}"
             self.stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{self.stream_id}")
             os.makedirs(self.stream_dir, exist_ok=True)
@@ -451,6 +468,7 @@ def upload_segment():
     try:
         header_target = request.headers.get("Target").lower()
         header_stream_key = request.headers.get("Stream-Key")
+        header_stream_id = request.headers.get("Stream-ID")
         header_segment_type = request.headers.get("Segment-Type")
         header_discontinuity = request.headers.get("Discontinuity").lower() == "true"
         header_duration = float(request.headers.get("Duration"))
@@ -460,6 +478,8 @@ def upload_segment():
 
     if not is_valid_stream_key(header_stream_key):
         return "Invalid Stream-Key", 400
+    if header_stream_id is not None and not is_valid_stream_id(header_stream_id):
+        return "Invalid Stream-ID", 400
 
     is_init = header_segment_type == "Initialization"
     is_final = header_segment_type == "Finalization"
@@ -473,23 +493,25 @@ def upload_segment():
         need_new_stream = False
         if stream is None or stream.finalized:
             need_new_stream = True
+        elif header_stream_id and stream.timestamp != header_stream_id:
+            need_new_stream = True
         elif is_init and stream.map_written and header_sequence <= stream.last_playlist_sequence:
             # Sequence number reset; treat as a brand new stream session
             need_new_stream = True
         if need_new_stream:
             old_stream = stream
             
-            # Check if we can resume an existing stream
-            latest_dir = find_latest_stream_dir(header_stream_key)
             restored = False
-            if latest_dir:
-                candidate_stream = StreamState.restore(header_stream_key, latest_dir)
-                if header_sequence > candidate_stream.last_playlist_sequence:
-                    stream = candidate_stream
-                    restored = True
+            if header_stream_id:
+                stream_dir = find_stream_dir(header_stream_key, header_stream_id)
+                if stream_dir:
+                    candidate_stream = StreamState.restore(header_stream_key, stream_dir)
+                    if header_sequence > candidate_stream.last_playlist_sequence:
+                        stream = candidate_stream
+                        restored = True
             
             if not restored:
-                stream = StreamState(header_stream_key)
+                stream = StreamState(header_stream_key, stream_id=header_stream_id)
             
             streams[header_stream_key] = stream
         else:
