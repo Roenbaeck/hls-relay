@@ -484,6 +484,17 @@ def upload_segment():
     is_init = header_segment_type == "Initialization"
     is_final = header_segment_type == "Finalization"
 
+    if is_init:
+        print(
+            f"Initialization segment received: stream_key={header_stream_key} sequence={header_sequence}",
+            flush=True,
+        )
+    elif is_final:
+        print(
+            f"Finalization segment received: stream_key={header_stream_key} sequence={header_sequence}",
+            flush=True,
+        )
+
     if header_duration == 0 and not (is_init or is_final):
         return "Zero-duration segment ignored.", 200
 
@@ -546,6 +557,10 @@ def upload_segment():
             if not stream.map_written:
                 # First init: start playlist fresh
                 stream.initialize_playlist(header_sequence, segment_name)
+                print(
+                    f"Initialization segment processed: stream={stream.stream_id} sequence={header_sequence} action=playlist_initialized",
+                    flush=True,
+                )
             else:
                 # Subsequent init: append new period without truncating playlist
                 with open(stream.playlist_file, "a") as f:
@@ -553,6 +568,10 @@ def upload_segment():
                     f.write(f"#EXT-X-MAP:URI=\"{segment_name}\"\n")
                 stream.period_index += 1
                 stream.add_event(f"New init segment (period {stream.period_index}) sequence {header_sequence}")
+                print(
+                    f"Initialization segment processed: stream={stream.stream_id} sequence={header_sequence} action=period_map_updated period={stream.period_index}",
+                    flush=True,
+                )
         # Drop stale media segments from queue (but keep file on disk)
         if (not is_init) and header_sequence <= stream.last_playlist_sequence:
             print(f"Stale segment ignored for playlist: seq={header_sequence} (last={stream.last_playlist_sequence}) stream={stream.stream_id}", flush=True)
@@ -566,6 +585,10 @@ def upload_segment():
             }
         if is_final:
             stream.arrived_segments['final'] = True # Use a simple flag for finalization
+            print(
+                f"Finalization segment processed: stream={stream.stream_id} sequence={header_sequence} action=finalize_requested",
+                flush=True,
+            )
 
         stream.update_playlist()
 
