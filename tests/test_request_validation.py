@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import unittest
 from base64 import b64encode
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import hls_relay
 
@@ -28,6 +28,26 @@ class TestRequestValidation(unittest.TestCase):
         headers = {
             **self.auth_headers,
             'Target': 'passive',
+            'Stream-Key': stream_key,
+            'Segment-Type': segment_type,
+            'Discontinuity': 'false',
+            'Duration': str(duration),
+            'Sequence': str(sequence),
+        }
+        if stream_id is not None:
+            headers['Stream-ID'] = stream_id
+
+        return self.client.post(
+            '/upload_segment',
+            headers=headers,
+            data=data,
+            environ_overrides={'REMOTE_ADDR': '127.0.0.1'},
+        )
+
+    def upload_with_target(self, target, stream_key, segment_type, sequence, duration, data=b'data', stream_id=None):
+        headers = {
+            **self.auth_headers,
+            'Target': target,
             'Stream-Key': stream_key,
             'Segment-Type': segment_type,
             'Discontinuity': 'false',
@@ -130,6 +150,57 @@ class TestRequestValidation(unittest.TestCase):
             self.assertIsNotNone(stream)
             self.assertEqual(stream.stream_id, f'resume_key_{stream_id}')
             self.assertTrue(stream.just_restored)
+
+    def test_finalization_does_not_restart_ffmpeg(self):
+        with patch.object(hls_relay.StreamState, 'start_ffmpeg_relay') as mock_start:
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_final_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_final_key', 'Media', 1, 2.0, data=b'media1').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_final_key', 'Media', 2, 2.0, data=b'media2').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_final_key', 'Media', 3, 2.0, data=b'media3').status_code, 200)
+
+            self.assertEqual(mock_start.call_count, 1)
+
+            response = self.upload_with_target('youtube', 'ffmpeg_final_key', 'Finalization', 4, 0, data=b'')
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(mock_start.call_count, 1)
+
+    def test_finalization_prefers_drain_over_immediate_stop(self):
+        with patch.object(hls_relay.StreamState, 'start_ffmpeg_relay') as mock_start, \
+             patch.object(hls_relay.StreamState, '_begin_ffmpeg_drain') as mock_begin_drain, \
+             patch.object(hls_relay.StreamState, '_stop_ffmpeg') as mock_stop_ffmpeg:
+            self.assertEqual(self.upload_with_target('youtube', 'drain_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'drain_key', 'Media', 1, 2.0, data=b'media1').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'drain_key', 'Media', 2, 2.0, data=b'media2').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'drain_key', 'Media', 3, 2.0, data=b'media3').status_code, 200)
+            self.assertEqual(mock_start.call_count, 1)
+
+            with hls_relay.stream_creation_lock:
+                stream = hls_relay.streams['drain_key']
+                stream.ffmpeg_process = MagicMock()
+                stream.ffmpeg_process.poll.return_value = None
+
+            response = self.upload_with_target('youtube', 'drain_key', 'Finalization', 4, 0, data=b'')
+
+            self.assertEqual(response.status_code, 200)
+            mock_begin_drain.assert_called_once()
+            mock_stop_ffmpeg.assert_not_called()
+
+    def test_replacement_stops_old_ffmpeg_immediately(self):
+        with patch.object(hls_relay.StreamState, '_begin_ffmpeg_drain') as mock_begin_drain, \
+             patch.object(hls_relay.StreamState, '_stop_ffmpeg') as mock_stop_ffmpeg:
+            self.assertEqual(self.upload_with_target('youtube', 'replace_key', 'Initialization', 0, 0, data=b'init', stream_id='session_a').status_code, 200)
+
+            with hls_relay.stream_creation_lock:
+                old_stream = hls_relay.streams['replace_key']
+                old_stream.ffmpeg_process = MagicMock()
+                old_stream.ffmpeg_process.poll.return_value = None
+
+            response = self.upload_with_target('youtube', 'replace_key', 'Initialization', 0, 0, data=b'new_init', stream_id='session_b')
+
+            self.assertEqual(response.status_code, 200)
+            mock_stop_ffmpeg.assert_called_once()
+            self.assertFalse(mock_begin_drain.called)
 
 
 if __name__ == '__main__':

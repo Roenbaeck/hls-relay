@@ -29,6 +29,9 @@ SEGMENTS_BEFORE_RELAY = 3
 # 60 seconds is roughly the time is takes for YouTube to time out if no data is received
 MISSING_SEGMENT_TIMEOUT = 60
 
+# Allow ffmpeg to drain a finalized playlist before forcing shutdown.
+FFMPEG_FINAL_DRAIN_TIMEOUT = 30
+
 # Timeout for skipping missing segments when new segments are arriving
 GAP_SKIP_TIMEOUT = 10
 
@@ -121,6 +124,7 @@ class StreamState:
         self.events = deque(maxlen=MAX_EVENT_HISTORY)
         self.last_ffmpeg_exit = None
         self.ffmpeg_log_thread = None
+        self.ffmpeg_drain_thread = None
         self.just_restored = False
 
         if is_restore and stream_dir:
@@ -194,7 +198,7 @@ class StreamState:
         self.last_playlist_sequence = init_sequence - 1
         self.add_event(f"Playlist initialized at sequence {init_sequence}")
 
-    def finalize_playlist(self):
+    def finalize_playlist(self, stop_ffmpeg_immediately=False):
         print(f"Finalizing playlist for stream {self.stream_id}", flush=True)
         if self.finalized:
             return
@@ -207,7 +211,10 @@ class StreamState:
             print(f"Error in finalize_playlist: {e}", flush=True)
         self.check_missing_segments_stop_event.set()
         self.check_missing_segments_started = False
-        self._stop_ffmpeg()
+        if stop_ffmpeg_immediately:
+            self._stop_ffmpeg()
+        else:
+            self._begin_ffmpeg_drain()
 
         # Remove this finished stream from the global streams dictionary
         global streams
@@ -436,6 +443,49 @@ class StreamState:
             self.ffmpeg_process = None
             self._stop_ffmpeg_logger()
 
+    def _record_ffmpeg_exit(self, exit_code):
+        self.add_event(f"ffmpeg exited with code {exit_code}")
+        self.last_ffmpeg_exit = {"code": exit_code, "signal": None}
+        self.ffmpeg_process = None
+        self._stop_ffmpeg_logger()
+
+    def _begin_ffmpeg_drain(self):
+        if not self.ffmpeg_process:
+            return
+        if self.ffmpeg_drain_thread and self.ffmpeg_drain_thread.is_alive():
+            return
+
+        proc = self.ffmpeg_process
+        if proc.poll() is not None:
+            self._record_ffmpeg_exit(proc.returncode)
+            return
+
+        timeout = FFMPEG_FINAL_DRAIN_TIMEOUT
+        self.add_event(f"ffmpeg drain started (timeout={timeout}s)")
+        print(
+            f"Allowing ffmpeg to drain naturally for stream {self.stream_id} for up to {timeout}s before forced shutdown",
+            flush=True,
+        )
+
+        def _drain():
+            try:
+                exit_code = proc.wait(timeout=timeout)
+                print(
+                    f"ffmpeg drained naturally for stream {self.stream_id} with exit code {exit_code}",
+                    flush=True,
+                )
+                self._record_ffmpeg_exit(exit_code)
+            except subprocess.TimeoutExpired:
+                print(
+                    f"ffmpeg drain timeout reached for stream {self.stream_id}; forcing shutdown",
+                    flush=True,
+                )
+                self.add_event(f"ffmpeg drain timeout after {timeout}s")
+                self._stop_ffmpeg()
+
+        self.ffmpeg_drain_thread = threading.Thread(target=_drain, daemon=True)
+        self.ffmpeg_drain_thread.start()
+
 # Rest of the authentication code remains the same
 def check_auth(username, password):
     return username == AUTH_USERNAME and password == AUTH_PASSWORD
@@ -531,7 +581,7 @@ def upload_segment():
     if old_stream is not None:
         old_stream.check_missing_segments_stop_event.set()
         if not old_stream.finalized:
-            old_stream.finalize_playlist()
+            old_stream.finalize_playlist(stop_ffmpeg_immediately=True)
 
     segment_name = f"p{stream.period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
     segment_path = os.path.join(stream.stream_dir, segment_name)
@@ -598,7 +648,7 @@ def upload_segment():
             stream.add_event(f"Force target override active: {FORCE_TARGET}")
             setattr(stream, "_force_target_logged", True)
 
-        if effective_target not in PASSIVE_TARGETS:
+        if (not stream.finalized) and effective_target not in PASSIVE_TARGETS:
             if stream.written_segment_count >= SEGMENTS_BEFORE_RELAY:
                 if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
                     print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments (target={effective_target})", flush=True)
