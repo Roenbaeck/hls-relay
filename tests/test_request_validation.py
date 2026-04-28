@@ -151,6 +151,106 @@ class TestRequestValidation(unittest.TestCase):
             self.assertEqual(stream.stream_id, f'resume_key_{stream_id}')
             self.assertTrue(stream.just_restored)
 
+    def test_stream_id_resume_preserves_keys_with_underscores(self):
+        stream_key = 'resume_key_with_underscore'
+        stream_id = '20260425_151500'
+
+        self.assertEqual(self.upload(stream_key, 'Initialization', 0, 0, data=b'init', stream_id=stream_id).status_code, 200)
+        self.assertEqual(self.upload(stream_key, 'Media', 1, 2.0, data=b'media', stream_id=stream_id).status_code, 200)
+        self.assertEqual(self.upload(stream_key, 'Finalization', 2, 0, data=b'', stream_id=stream_id).status_code, 200)
+
+        response = self.upload(stream_key, 'Media', 3, 2.0, data=b'late', stream_id=stream_id)
+
+        self.assertEqual(response.status_code, 200)
+        stream_dirs = os.listdir(self.test_dir)
+        self.assertEqual(stream_dirs, [f'{stream_key}_{stream_id}'])
+
+        with hls_relay.stream_creation_lock:
+            stream = hls_relay.streams.get(stream_key)
+            self.assertIsNotNone(stream)
+            self.assertEqual(stream.timestamp, stream_id)
+            self.assertEqual(stream.stream_id, f'{stream_key}_{stream_id}')
+
+    def test_negative_duration_media_segment_is_ignored(self):
+        self.assertEqual(self.upload('negative_duration_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
+
+        response = self.upload('negative_duration_key', 'Media', 1, -1.0, data=b'media')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_data(as_text=True), 'Non-positive duration segment ignored.')
+
+        stream_dirs = os.listdir(self.test_dir)
+        self.assertEqual(len(stream_dirs), 1)
+        playlist_path = os.path.join(self.test_dir, stream_dirs[0], 'playlist.m3u8')
+        with open(playlist_path, 'r') as f:
+            playlist = f.read()
+
+        self.assertNotIn('#EXTINF', playlist)
+
+    def test_new_init_uses_new_period_prefix_and_resets_sequence_window(self):
+        stream_key = 'period_key'
+
+        self.assertEqual(self.upload(stream_key, 'Initialization', 0, 0, data=b'init0').status_code, 200)
+        self.assertEqual(self.upload(stream_key, 'Media', 1, 2.0, data=b'media0').status_code, 200)
+        self.assertEqual(self.upload(stream_key, 'Initialization', 0, 0, data=b'init1').status_code, 200)
+        self.assertEqual(self.upload(stream_key, 'Media', 1, 2.0, data=b'media1').status_code, 200)
+
+        stream_dirs = os.listdir(self.test_dir)
+        self.assertEqual(len(stream_dirs), 1)
+        stream_dir = os.path.join(self.test_dir, stream_dirs[0])
+        playlist_path = os.path.join(stream_dir, 'playlist.m3u8')
+        with open(playlist_path, 'r') as f:
+            playlist = f.read()
+
+        self.assertIn('#EXT-X-MAP:URI="p0_segment_000000.mp4"', playlist)
+        self.assertIn('#EXT-X-MAP:URI="p1_segment_000000.mp4"', playlist)
+        self.assertIn('p1_segment_000001.m4s', playlist)
+        self.assertTrue(os.path.exists(os.path.join(stream_dir, 'p1_segment_000000.mp4')))
+
+    def test_ffmpeg_start_failure_returns_error_response(self):
+        with patch('subprocess.Popen', side_effect=FileNotFoundError('ffmpeg not found')):
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_missing_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_missing_key', 'Media', 1, 2.0, data=b'media1').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_missing_key', 'Media', 2, 2.0, data=b'media2').status_code, 200)
+
+            response = self.upload_with_target('youtube', 'ffmpeg_missing_key', 'Media', 3, 2.0, data=b'media3')
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn('Error starting ffmpeg relay', response.get_data(as_text=True))
+
+    def test_ffmpeg_restart_uses_backoff_after_failure(self):
+        with patch.object(hls_relay.StreamState, 'start_ffmpeg_relay') as mock_start:
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Initialization', 0, 0, data=b'init').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Media', 1, 2.0, data=b'media1').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Media', 2, 2.0, data=b'media2').status_code, 200)
+            self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Media', 3, 2.0, data=b'media3').status_code, 200)
+            self.assertEqual(mock_start.call_count, 1)
+
+            with hls_relay.stream_creation_lock:
+                stream = hls_relay.streams['ffmpeg_backoff_key']
+                stream.ffmpeg_process = MagicMock()
+                stream.ffmpeg_process.poll.return_value = 1
+                stream.ffmpeg_process.returncode = 1
+
+            response = self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Media', 4, 2.0, data=b'media4')
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(mock_start.call_count, 1)
+
+            response = self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Media', 5, 2.0, data=b'media5')
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(mock_start.call_count, 1)
+
+            with hls_relay.stream_creation_lock:
+                stream = hls_relay.streams['ffmpeg_backoff_key']
+                stream.ffmpeg_restart_not_before = 0.0
+
+            response = self.upload_with_target('youtube', 'ffmpeg_backoff_key', 'Media', 6, 2.0, data=b'media6')
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(mock_start.call_count, 2)
+
     def test_finalization_does_not_restart_ffmpeg(self):
         with patch.object(hls_relay.StreamState, 'start_ffmpeg_relay') as mock_start:
             self.assertEqual(self.upload_with_target('youtube', 'ffmpeg_final_key', 'Initialization', 0, 0, data=b'init').status_code, 200)

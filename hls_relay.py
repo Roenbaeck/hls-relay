@@ -32,6 +32,9 @@ MISSING_SEGMENT_TIMEOUT = 60
 # Allow ffmpeg to drain a finalized playlist before forcing shutdown.
 FFMPEG_FINAL_DRAIN_TIMEOUT = 30
 
+# Avoid restarting ffmpeg on every upload when it is failing consistently.
+FFMPEG_RESTART_COOLDOWN = 5
+
 # Timeout for skipping missing segments when new segments are arriving
 GAP_SKIP_TIMEOUT = 10
 
@@ -76,21 +79,6 @@ def validate_path_component(component, component_name="path component"):
         return False, f"Invalid {component_name}", 400
     return True, None, None
 
-def find_latest_stream_dir(stream_key):
-    try:
-        candidates = []
-        for name in os.listdir(BASE_SEGMENTS_DIR):
-            if name.startswith(f"{stream_key}_"):
-                candidates.append(name)
-        if not candidates:
-            return None
-        # Sort by timestamp in the name (assuming format key_YYYYMMDD_HHMMSS)
-        candidates.sort(reverse=True)
-        return os.path.join(BASE_SEGMENTS_DIR, candidates[0])
-    except FileNotFoundError:
-        return None
-
-
 def find_stream_dir(stream_key, stream_id):
     stream_dir = os.path.join(BASE_SEGMENTS_DIR, f"{stream_key}_{stream_id}")
     if os.path.isdir(stream_dir):
@@ -105,7 +93,7 @@ def generate_server_stream_id():
 class StreamState:
     def __init__(self, stream_key, stream_dir=None, is_restore=False, stream_id=None):
         self.stream_key = stream_key
-        self.playlist_lock = threading.Lock()
+        self.playlist_lock = threading.RLock()
         self.arrived_segments = {}  # Dictionary to store arrived segments, key=sequence
         self.last_playlist_sequence = -1 # Track the last sequence added to the playlist
         self.map_written = False
@@ -125,14 +113,17 @@ class StreamState:
         self.last_ffmpeg_exit = None
         self.ffmpeg_log_thread = None
         self.ffmpeg_drain_thread = None
+        self.ffmpeg_restart_not_before = 0.0
+        self.ffmpeg_restart_suppressed = False
         self.just_restored = False
 
         if is_restore and stream_dir:
             self.stream_dir = stream_dir
             self.stream_id = os.path.basename(stream_dir)
-            try:
-                self.timestamp = self.stream_id.split('_', 1)[1]
-            except IndexError:
+            prefix = f"{self.stream_key}_"
+            if self.stream_id.startswith(prefix):
+                self.timestamp = self.stream_id[len(prefix):]
+            else:
                 self.timestamp = generate_server_stream_id()
             self.playlist_file = os.path.join(self.stream_dir, "playlist.m3u8")
             self._restore_state()
@@ -200,15 +191,16 @@ class StreamState:
 
     def finalize_playlist(self, stop_ffmpeg_immediately=False):
         print(f"Finalizing playlist for stream {self.stream_id}", flush=True)
-        if self.finalized:
-            return
-        self.finalized = True
-        self.add_event("Playlist finalized")
-        try:
-            with open(self.playlist_file, "a") as f:
-                f.write("#EXT-X-ENDLIST\n")
-        except Exception as e:
-            print(f"Error in finalize_playlist: {e}", flush=True)
+        with self.playlist_lock:
+            if self.finalized:
+                return
+            self.finalized = True
+            self.add_event("Playlist finalized")
+            try:
+                with open(self.playlist_file, "a") as f:
+                    f.write("#EXT-X-ENDLIST\n")
+            except Exception as e:
+                print(f"Error in finalize_playlist: {e}", flush=True)
         self.check_missing_segments_stop_event.set()
         self.check_missing_segments_started = False
         if stop_ffmpeg_immediately:
@@ -297,14 +289,21 @@ class StreamState:
 
         start_desc = "edge" if live_start_index is None else str(live_start_index)
         print(f"Starting ffmpeg relay for stream {stream_key} to target {target} with live_start_index {start_desc}", flush=True)
-        self.ffmpeg_process = subprocess.Popen(
-            ffmpeg_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        try:
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as e:
+            self.ffmpeg_process = None
+            self.add_event(f"ffmpeg failed to start: {e}")
+            raise RuntimeError(f"ffmpeg failed to start: {e}") from e
         self._start_ffmpeg_logger()
+        self.ffmpeg_restart_not_before = 0.0
+        self.ffmpeg_restart_suppressed = False
         self.add_event(f"ffmpeg started for {target} (start_index={start_desc})")
 
     def update_playlist(self):
@@ -545,8 +544,8 @@ def upload_segment():
             flush=True,
         )
 
-    if header_duration == 0 and not (is_init or is_final):
-        return "Zero-duration segment ignored.", 200
+    if header_duration <= 0 and not (is_init or is_final):
+        return "Non-positive duration segment ignored.", 200
 
     old_stream = None
     with stream_creation_lock:
@@ -555,9 +554,6 @@ def upload_segment():
         if stream is None or stream.finalized:
             need_new_stream = True
         elif header_stream_id and stream.timestamp != header_stream_id:
-            need_new_stream = True
-        elif is_init and stream.map_written and header_sequence <= stream.last_playlist_sequence:
-            # Sequence number reset; treat as a brand new stream session
             need_new_stream = True
         if need_new_stream:
             old_stream = stream
@@ -583,26 +579,29 @@ def upload_segment():
         if not old_stream.finalized:
             old_stream.finalize_playlist(stop_ffmpeg_immediately=True)
 
-    segment_name = f"p{stream.period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
-    segment_path = os.path.join(stream.stream_dir, segment_name)
-
-    try:
-        with open(segment_path, "wb") as f:
-            f.write(request.data)
-    except Exception as e:
-        return f"Error saving segment: {e}", 500
-    
-    print(f"Saved segment: {segment_name} for stream: {stream.stream_id}", flush=True)
-
     stream.last_upload_time = time.time()
     # Start missing segments check thread
     if not stream.check_missing_segments_started:
-        if not stream.check_missing_segments_started:
-            stream.check_missing_segments_stop_event.clear()
-            threading.Thread(target=stream.check_missing_segments, daemon=True).start()
-            stream.check_missing_segments_started = True
+        stream.check_missing_segments_stop_event.clear()
+        threading.Thread(target=stream.check_missing_segments, daemon=True).start()
+        stream.check_missing_segments_started = True
 
     with stream.playlist_lock:
+        segment_period_index = stream.period_index
+        if is_init and stream.map_written:
+            segment_period_index += 1
+
+        segment_name = f"p{segment_period_index}_segment_{header_sequence:06d}.{'mp4' if is_init else 'm4s'}"
+        segment_path = os.path.join(stream.stream_dir, segment_name)
+
+        try:
+            with open(segment_path, "wb") as f:
+                f.write(request.data)
+        except Exception as e:
+            return f"Error saving segment: {e}", 500
+
+        print(f"Saved segment: {segment_name} for stream: {stream.stream_id}", flush=True)
+
         if is_init:
             if not stream.map_written:
                 # First init: start playlist fresh
@@ -613,10 +612,13 @@ def upload_segment():
                 )
             else:
                 # Subsequent init: append new period without truncating playlist
+                stream.period_index = segment_period_index
                 with open(stream.playlist_file, "a") as f:
                     f.write("#EXT-X-DISCONTINUITY\n")
                     f.write(f"#EXT-X-MAP:URI=\"{segment_name}\"\n")
-                stream.period_index += 1
+                stream.last_playlist_sequence = header_sequence - 1
+                stream._gap_wait_seq = None
+                stream._gap_wait_start = None
                 stream.add_event(f"New init segment (period {stream.period_index}) sequence {header_sequence}")
                 print(
                     f"Initialization segment processed: stream={stream.stream_id} sequence={header_sequence} action=period_map_updated period={stream.period_index}",
@@ -650,27 +652,40 @@ def upload_segment():
 
         if (not stream.finalized) and effective_target not in PASSIVE_TARGETS:
             if stream.written_segment_count >= SEGMENTS_BEFORE_RELAY:
-                if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
-                    print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments (target={effective_target})", flush=True)
-                    stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=0)
-                elif getattr(stream, 'just_restored', False):
-                    # Resume from the segment that triggered the restore (the current one)
-                    # live_start_index is 0-based index of the segment in the playlist.
-                    # written_segment_count includes the current segment.
-                    # So index = count - 1.
-                    start_index = max(0, stream.written_segment_count - 1)
-                    print(f"Resuming ffmpeg for stream {stream.stream_id} at index {start_index} (target={effective_target})", flush=True)
-                    stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=start_index)
-                    stream.just_restored = False
-                elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
-                    print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge (target={effective_target})", flush=True)
-                    if stream.ffmpeg_process and stream.ffmpeg_process.poll() is not None:
-                        exit_code = stream.ffmpeg_process.returncode
-                        stream.add_event(f"ffmpeg exited with code {exit_code}")
-                        stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
-                        stream.ffmpeg_process = None
-                        stream._stop_ffmpeg_logger()
-                    stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=None)
+                try:
+                    if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
+                        print(f"Starting ffmpeg for stream {stream.stream_id} with {SEGMENTS_BEFORE_RELAY} buffered segments (target={effective_target})", flush=True)
+                        stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=0)
+                    elif getattr(stream, 'just_restored', False):
+                        # Resume from the segment that triggered the restore (the current one)
+                        # live_start_index is 0-based index of the segment in the playlist.
+                        # written_segment_count includes the current segment.
+                        # So index = count - 1.
+                        start_index = max(0, stream.written_segment_count - 1)
+                        print(f"Resuming ffmpeg for stream {stream.stream_id} at index {start_index} (target={effective_target})", flush=True)
+                        stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=start_index)
+                        stream.just_restored = False
+                    elif stream.ffmpeg_process is None or stream.ffmpeg_process.poll() is not None:
+                        now = time.time()
+                        if stream.ffmpeg_process and stream.ffmpeg_process.poll() is not None:
+                            exit_code = stream.ffmpeg_process.returncode
+                            stream.add_event(f"ffmpeg exited with code {exit_code}")
+                            stream.last_ffmpeg_exit = {"code": exit_code, "signal": None}
+                            stream.ffmpeg_process = None
+                            stream._stop_ffmpeg_logger()
+                            stream.ffmpeg_restart_not_before = now + FFMPEG_RESTART_COOLDOWN
+                        if now < stream.ffmpeg_restart_not_before:
+                            if not stream.ffmpeg_restart_suppressed:
+                                wait_seconds = max(0.0, stream.ffmpeg_restart_not_before - now)
+                                stream.add_event(f"ffmpeg restart suppressed for {wait_seconds:.1f}s after failure")
+                                stream.ffmpeg_restart_suppressed = True
+                        else:
+                            print(f"Restarting ffmpeg for stream {stream.stream_id} at live edge (target={effective_target})", flush=True)
+                            stream.start_ffmpeg_relay(effective_target, header_stream_key, live_start_index=None)
+                except RuntimeError as e:
+                    stream.ffmpeg_restart_not_before = time.time() + FFMPEG_RESTART_COOLDOWN
+                    stream.ffmpeg_restart_suppressed = False
+                    return f"Error starting ffmpeg relay: {e}", 500
         else:
             if stream.written_segment_count == SEGMENTS_BEFORE_RELAY:
                 stream.add_event(f"Passive mode: playlist building only (no relay). Target={effective_target}")
